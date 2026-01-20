@@ -1,0 +1,35 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# WASM build artifacts
+**/pkg/
+
+# Node.js
+node_modules/
+.npm
+
+# Vite
+dist/
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
