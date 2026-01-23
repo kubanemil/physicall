@@ -401,72 +401,93 @@ const QUAD_VERTICES: &[QuadVertex] = &[
 /// Quad indices: 2 triangles forming the quad.
 const QUAD_INDICES: &[u16] = &[0, 1, 2, 2, 1, 3];
 
-/// Per-instance data for point rendering.
+/// Per-instance data for particle rendering.
+/// Used by both compute shader (storage buffer) and render shader (vertex buffer).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct PointInstance {
+struct Particle {
     position: [f32; 3],
     size: f32,
-    color: [f32; 3],
+    velocity: [f32; 3],
     _padding: f32,  // Align to 32 bytes
 }
 
-impl PointInstance {
+impl Particle {
     const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
         1 => Float32x3,  // world_pos @ location(1)
         2 => Float32,    // size @ location(2)
-        3 => Float32x3,  // color @ location(3)
+        3 => Float32x3,  // velocity @ location(3)
     ];
 
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<PointInstance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,  // Per-instance, not per-vertex
+            array_stride: std::mem::size_of::<Particle>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
             attributes: &Self::ATTRIBS,
         }
     }
 }
 
-/// Creates demo point instances in a spherical distribution.
-fn create_demo_points() -> Vec<PointInstance> {
-    let mut points = Vec::new();
-    let num_points = 200;
+/// Simulation parameters uniform buffer.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SimParams {
+    delta_time: f32,
+    gravity_strength: f32,
+    damping: f32,
+    particle_count: u32,
+}
+
+/// Physics simulation constants
+const PARTICLE_COUNT: u32 = 10_000;
+const PARTICLE_SIZE: f32 = 0.008;        // Smaller for 10k particles
+const GRAVITY_STRENGTH: f32 = 0.00005;   // Much weaker per-particle for 10k
+const DAMPING: f32 = 0.998;
+
+/// Creates initial particles in a spherical distribution with small tangential velocities.
+fn create_initial_particles(count: u32) -> Vec<Particle> {
+    let mut particles = Vec::with_capacity(count as usize);
 
     // Use golden ratio spiral for even distribution on sphere
     let golden_ratio = (1.0 + 5.0_f32.sqrt()) / 2.0;
     let angle_increment = std::f32::consts::PI * 2.0 * golden_ratio;
 
-    for i in 0..num_points {
-        let t = i as f32 / (num_points - 1) as f32;
+    // Larger radius for 10k particles to prevent immediate collapse
+    let base_radius = 3.0;
+
+    for i in 0..count {
+        let t = i as f32 / (count - 1).max(1) as f32;
         let inclination = (1.0 - 2.0 * t).acos();
         let azimuth = angle_increment * i as f32;
 
-        // Spherical to Cartesian, radius varies for visual interest
-        let base_radius = 1.2;
-        let radius_variation = 0.3 * ((i as f32 * 0.1).sin());
+        // Vary radius slightly for depth
+        let radius_variation = 0.5 * ((i as f32 * 0.1).sin());
         let r = base_radius + radius_variation;
 
-        let x = r * inclination.sin() * azimuth.cos();
-        let y = r * inclination.sin() * azimuth.sin();
-        let z = r * inclination.cos();
+        let sin_inc = inclination.sin();
+        let cos_inc = inclination.cos();
+        let sin_az = azimuth.sin();
+        let cos_az = azimuth.cos();
 
-        // Color based on position (normalized to 0-1)
-        let color_r = (x / 2.0 + 0.5).clamp(0.2, 1.0);
-        let color_g = (y / 2.0 + 0.5).clamp(0.2, 1.0);
-        let color_b = (z / 2.0 + 0.5).clamp(0.2, 1.0);
+        let x = r * sin_inc * cos_az;
+        let y = r * sin_inc * sin_az;
+        let z = r * cos_inc;
 
-        // Vary size
-        let size = 0.015 + 0.015 * ((i as f32 * 0.2).sin().abs());
+        // Small tangential velocity for initial rotation (creates galaxy-like motion)
+        let tangent_speed = 0.1;
+        let vx = -tangent_speed * sin_az;
+        let vy = tangent_speed * cos_az;
+        let vz = 0.0;
 
-        points.push(PointInstance {
+        particles.push(Particle {
             position: [x, y, z],
-            size,
-            color: [color_r, color_g, color_b],
+            size: PARTICLE_SIZE,
+            velocity: [vx, vy, vz],
             _padding: 0.0,
         });
     }
 
-    points
+    particles
 }
 
 // ============================================================================
@@ -713,12 +734,18 @@ struct State {
     line_pipeline: wgpu::RenderPipeline,
     line_vertex_buffer: wgpu::Buffer,
     line_vertex_count: u32,
+    // Particle system (compute + render)
+    particle_buffers: [wgpu::Buffer; 2],  // Double-buffered for ping-pong
+    particle_count: u32,
+    compute_pipeline: wgpu::ComputePipeline,
+    compute_bind_groups: [wgpu::BindGroup; 2],
+    sim_params_buffer: wgpu::Buffer,
+    frame_index: u32,
+    last_frame_time: Option<f64>,
     // Point rendering (instanced quads)
     point_pipeline: wgpu::RenderPipeline,
     quad_vertex_buffer: wgpu::Buffer,
     quad_index_buffer: wgpu::Buffer,
-    point_instance_buffer: wgpu::Buffer,
-    point_instance_count: u32,
     // Sphere rendering (instanced icosphere)
     sphere_pipeline: wgpu::RenderPipeline,
     sphere_vertex_buffer: wgpu::Buffer,
@@ -906,14 +933,14 @@ impl State {
             source: wgpu::ShaderSource::Wgsl(include_str!("../../../shaders/point.wgsl").into()),
         });
 
-        // Create point render pipeline with two vertex buffers (quad + instance)
+        // Create point render pipeline with two vertex buffers (quad + particle instance)
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Point Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &point_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[QuadVertex::desc(), PointInstance::desc()],
+                buffers: &[QuadVertex::desc(), Particle::desc()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -965,15 +992,154 @@ impl State {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        // Create point instance buffer with demo data
-        let demo_points = create_demo_points();
-        let point_instance_count = demo_points.len() as u32;
+        // ====================================================================
+        // Particle System Setup (Compute + Render Buffer Sharing)
+        // ====================================================================
 
-        let point_instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Point Instance Buffer"),
-            contents: bytemuck::cast_slice(&demo_points),
-            usage: wgpu::BufferUsages::VERTEX,
+        // Create initial particles
+        let initial_particles = create_initial_particles(PARTICLE_COUNT);
+        let particle_count = initial_particles.len() as u32;
+
+        // Buffer usage for compute-render sharing
+        let particle_buffer_usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::COPY_DST;
+
+        // Create double-buffered particle storage (ping-pong pattern)
+        let particle_buffers = [
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Particle Buffer 0"),
+                contents: bytemuck::cast_slice(&initial_particles),
+                usage: particle_buffer_usage,
+            }),
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Particle Buffer 1"),
+                contents: bytemuck::cast_slice(&initial_particles),
+                usage: particle_buffer_usage,
+            }),
+        ];
+
+        // Create simulation parameters uniform buffer
+        let sim_params = SimParams {
+            delta_time: 1.0 / 60.0,
+            gravity_strength: GRAVITY_STRENGTH,
+            damping: DAMPING,
+            particle_count,
+        };
+        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Simulation Params Buffer"),
+            contents: bytemuck::cast_slice(&[sim_params]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        // Create compute bind group layout
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute Bind Group Layout"),
+                entries: &[
+                    // Binding 0: Input particles (read-only storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 1: Output particles (read-write storage)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 2: Simulation parameters (uniform)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Create compute pipeline layout
+        let compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Compute Pipeline Layout"),
+                bind_group_layouts: &[&compute_bind_group_layout],
+                ..Default::default()
+            });
+
+        // Load compute shader
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Particle Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/particle_compute.wgsl").into(),
+            ),
+        });
+
+        // Create compute pipeline
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Particle Compute Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        // Create two bind groups for ping-pong pattern
+        // bind_group_0: read from buffer[0], write to buffer[1]
+        // bind_group_1: read from buffer[1], write to buffer[0]
+        let compute_bind_groups = [
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute Bind Group 0"),
+                layout: &compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: particle_buffers[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }),
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Compute Bind Group 1"),
+                layout: &compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: particle_buffers[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }),
+        ];
 
         // ====================================================================
         // Sphere Pipeline Setup (Instanced Icosphere)
@@ -1073,11 +1239,16 @@ impl State {
             line_pipeline,
             line_vertex_buffer,
             line_vertex_count,
+            particle_buffers,
+            particle_count,
+            compute_pipeline,
+            compute_bind_groups,
+            sim_params_buffer,
+            frame_index: 0,
+            last_frame_time: None,
             point_pipeline,
             quad_vertex_buffer,
             quad_index_buffer,
-            point_instance_buffer,
-            point_instance_count,
             sphere_pipeline,
             sphere_vertex_buffer,
             sphere_index_buffer,
@@ -1102,6 +1273,33 @@ impl State {
 
     /// Renders a single frame.
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Calculate delta time
+        let now = web_sys::window()
+            .expect("No window")
+            .performance()
+            .expect("No performance")
+            .now();
+        let dt = match self.last_frame_time {
+            Some(last) => ((now - last) / 1000.0) as f32, // ms to seconds
+            None => 1.0 / 60.0, // Assume 60fps for first frame
+        };
+        self.last_frame_time = Some(now);
+        // Clamp dt to avoid instability on lag spikes
+        let dt = dt.min(1.0 / 30.0);
+
+        // Update simulation parameters
+        let sim_params = SimParams {
+            delta_time: dt,
+            gravity_strength: GRAVITY_STRENGTH,
+            damping: DAMPING,
+            particle_count: self.particle_count,
+        };
+        self.queue.write_buffer(
+            &self.sim_params_buffer,
+            0,
+            bytemuck::cast_slice(&[sim_params]),
+        );
+
         // Update camera uniform buffer
         self.camera_uniform.update(&self.camera, &self.projection);
         self.queue.write_buffer(
@@ -1121,6 +1319,25 @@ impl State {
                 label: Some("Render Encoder"),
             });
 
+        // Determine which buffers to use for ping-pong
+        let read_idx = (self.frame_index % 2) as usize;
+        let write_idx = ((self.frame_index + 1) % 2) as usize;
+
+        // Compute pass: update particle positions
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Particle Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
+            // Dispatch workgroups: ceil(particle_count / 256)
+            let workgroup_count = (self.particle_count + 255) / 256;
+            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+        }
+        // Implicit memory barrier here - wgpu ensures compute writes complete before render reads
+
+        // Render pass
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
@@ -1157,13 +1374,13 @@ impl State {
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
             render_pass.draw(0..self.line_vertex_count, 0..1);
 
-            // Draw points (instanced quads)
+            // Draw particles (instanced quads) - read from the buffer just written by compute
             render_pass.set_pipeline(&self.point_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.point_instance_buffer.slice(..));
+            render_pass.set_vertex_buffer(1, self.particle_buffers[write_idx].slice(..));
             render_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..6, 0, 0..self.point_instance_count);
+            render_pass.draw_indexed(0..6, 0, 0..self.particle_count);
 
             // Draw spheres (instanced icosphere)
             render_pass.set_pipeline(&self.sphere_pipeline);
@@ -1176,6 +1393,9 @@ impl State {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // Increment frame index for next frame's ping-pong
+        self.frame_index = self.frame_index.wrapping_add(1);
 
         Ok(())
     }
