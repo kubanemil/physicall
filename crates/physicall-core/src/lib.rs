@@ -155,8 +155,83 @@ impl CameraUniform {
 }
 
 // ============================================================================
+// Ray Unprojection (for click-to-spawn)
+// ============================================================================
+
+use glam::Vec4;
+
+/// Converts screen coordinates to a world-space ray.
+/// Returns (ray_origin, ray_direction).
+fn screen_to_world_ray(
+    screen_x: f32,
+    screen_y: f32,
+    canvas_width: u32,
+    canvas_height: u32,
+    camera: &OrbitCamera,
+    projection: &Projection,
+) -> (Vec3, Vec3) {
+    // Convert screen coords to NDC (-1 to 1)
+    let ndc_x = (2.0 * screen_x / canvas_width as f32) - 1.0;
+    let ndc_y = 1.0 - (2.0 * screen_y / canvas_height as f32); // Y flipped
+
+    // Get inverse view-projection matrix
+    let view = camera.view_matrix();
+    let proj = projection.matrix();
+    let view_proj = proj * view;
+    let inv_view_proj = view_proj.inverse();
+
+    // Unproject near and far points (NDC z: 0 = near, 1 = far for WebGPU)
+    let near_ndc = Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+    let far_ndc = Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+
+    let near_world = inv_view_proj * near_ndc;
+    let far_world = inv_view_proj * far_ndc;
+
+    // Perspective divide
+    let near_world = Vec3::new(
+        near_world.x / near_world.w,
+        near_world.y / near_world.w,
+        near_world.z / near_world.w,
+    );
+    let far_world = Vec3::new(
+        far_world.x / far_world.w,
+        far_world.y / far_world.w,
+        far_world.z / far_world.w,
+    );
+
+    // Ray from near to far
+    let direction = (far_world - near_world).normalize();
+
+    (near_world, direction)
+}
+
+/// Computes ray-plane intersection.
+/// Returns the intersection point if the ray hits the plane.
+fn ray_plane_intersection(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Option<Vec3> {
+    let denom = ray_dir.dot(plane_normal);
+    if denom.abs() < 0.0001 {
+        return None; // Ray parallel to plane
+    }
+
+    let t = (plane_point - ray_origin).dot(plane_normal) / denom;
+    if t < 0.0 {
+        return None; // Intersection behind ray origin
+    }
+
+    Some(ray_origin + ray_dir * t)
+}
+
+// ============================================================================
 // Input Handling
 // ============================================================================
+
+/// Threshold in pixels for distinguishing click from drag.
+const CLICK_THRESHOLD: i32 = 5;
 
 /// Tracks mouse input state between events.
 struct InputState {
@@ -165,6 +240,10 @@ struct InputState {
     last_y: i32,
     rotate_delta: (f32, f32),
     zoom_delta: f32,
+    // Click detection for spawning
+    mouse_down_pos: Option<(i32, i32)>,  // Position at mousedown
+    pending_spawn: Option<(f32, f32)>,   // Screen coords for spawn (client coords)
+    total_drag_distance: i32,            // Accumulated movement since mousedown
 }
 
 impl InputState {
@@ -175,6 +254,9 @@ impl InputState {
             last_y: 0,
             rotate_delta: (0.0, 0.0),
             zoom_delta: 0.0,
+            mouse_down_pos: None,
+            pending_spawn: None,
+            total_drag_distance: 0,
         }
     }
 
@@ -186,6 +268,11 @@ impl InputState {
         self.zoom_delta = 0.0;
         (rotate, zoom)
     }
+
+    /// Returns and clears pending spawn position.
+    fn take_pending_spawn(&mut self) -> Option<(f32, f32)> {
+        self.pending_spawn.take()
+    }
 }
 
 // Global input state accessible from event closures
@@ -193,12 +280,12 @@ thread_local! {
     static INPUT_STATE: Rc<RefCell<InputState>> = Rc::new(RefCell::new(InputState::new()));
 }
 
-/// Set up mouse event listeners for camera control.
+/// Set up mouse event listeners for camera control and click-to-spawn.
 fn setup_mouse_events(
     canvas: &HtmlCanvasElement,
     state: Rc<RefCell<InputState>>,
 ) -> Result<(), JsValue> {
-    // Mousedown - start dragging
+    // Mousedown - start dragging and record position for click detection
     {
         let state = state.clone();
         let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
@@ -208,6 +295,9 @@ fn setup_mouse_events(
                 s.is_dragging = true;
                 s.last_x = event.client_x();
                 s.last_y = event.client_y();
+                // Record canvas-relative position for click detection (offset_x/y)
+                s.mouse_down_pos = Some((event.offset_x(), event.offset_y()));
+                s.total_drag_distance = 0;
             }
         });
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
@@ -224,6 +314,8 @@ fn setup_mouse_events(
                 let dy = event.client_y() - s.last_y;
                 s.rotate_delta.0 += dx as f32;
                 s.rotate_delta.1 += dy as f32;
+                // Track total drag distance for click detection
+                s.total_drag_distance += dx.abs() + dy.abs();
                 s.last_x = event.client_x();
                 s.last_y = event.client_y();
             }
@@ -232,12 +324,36 @@ fn setup_mouse_events(
         closure.forget();
     }
 
-    // Mouseup on window - stop dragging (catches releases outside canvas)
+    // Mouseup - stop dragging and detect clicks
+    {
+        let state = state.clone();
+        let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
+            let mut s = state.borrow_mut();
+            if s.is_dragging {
+                s.is_dragging = false;
+                // Check if this was a click (minimal movement)
+                if s.total_drag_distance < CLICK_THRESHOLD {
+                    if let Some((down_x, down_y)) = s.mouse_down_pos {
+                        // Use the canvas-relative mousedown position for spawning
+                        s.pending_spawn = Some((down_x as f32, down_y as f32));
+                    }
+                }
+                s.mouse_down_pos = None;
+            }
+        });
+        // Listen on canvas instead of window to get correct coordinates
+        canvas.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    // Also listen on window for mouseup outside canvas (just to stop dragging)
     {
         let state = state.clone();
         let window = web_sys::window().expect("No window");
         let closure = Closure::<dyn FnMut(_)>::new(move |_: MouseEvent| {
-            state.borrow_mut().is_dragging = false;
+            let mut s = state.borrow_mut();
+            s.is_dragging = false;
+            s.mouse_down_pos = None;
         });
         window.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -433,51 +549,54 @@ impl Particle {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SimParams {
     delta_time: f32,
-    gravity_strength: f32,
+    gravitational_constant: f32,  // G - gravitational constant for N-body
     damping: f32,
     particle_count: u32,
+    softening_sq: f32,            // epsilon² - prevents singularity at r=0
+    _padding: [f32; 3],
 }
 
-/// Physics simulation constants
-const PARTICLE_COUNT: u32 = 10_000;
-const PARTICLE_SIZE: f32 = 0.008;        // Smaller for 10k particles
-const GRAVITY_STRENGTH: f32 = 0.00005;   // Much weaker per-particle for 10k
-const DAMPING: f32 = 0.998;
+/// Physics simulation constants for N-body simulation
+const PARTICLE_COUNT: u32 = 200;          // Reduced for N-body O(n²) performance
+const MAX_PARTICLES: u32 = 2_000;         // Pre-allocated buffer capacity
+const PARTICLE_SIZE: f32 = 0.03;          // Larger for fewer particles
+const GRAVITATIONAL_CONSTANT: f32 = 0.3;  // Tunable G (lower for stability)
+const SOFTENING_SQ: f32 = 0.1;            // Prevents singularity at close range
+const DAMPING: f32 = 1.0;                 // No damping for orbital conservation
 
-/// Creates initial particles in a spherical distribution with small tangential velocities.
+/// Creates initial particles in a ring distribution for N-body simulation.
+/// Particles are arranged in a disk in the XZ plane with tangential velocities
+/// to create orbital motion.
 fn create_initial_particles(count: u32) -> Vec<Particle> {
     let mut particles = Vec::with_capacity(count as usize);
 
-    // Use golden ratio spiral for even distribution on sphere
-    let golden_ratio = (1.0 + 5.0_f32.sqrt()) / 2.0;
-    let angle_increment = std::f32::consts::PI * 2.0 * golden_ratio;
+    // Ring parameters
+    let inner_radius = 0.8;
+    let outer_radius = 2.0;
 
-    // Larger radius for 10k particles to prevent immediate collapse
-    let base_radius = 3.0;
+    // Tangential velocity for roughly circular orbits
+    // v = sqrt(G * M_enclosed / r) approximated empirically
+    let base_orbital_speed = 0.4;
 
     for i in 0..count {
-        let t = i as f32 / (count - 1).max(1) as f32;
-        let inclination = (1.0 - 2.0 * t).acos();
-        let azimuth = angle_increment * i as f32;
+        let t = i as f32 / count as f32;
+        let angle = t * std::f32::consts::PI * 2.0 * 3.0; // 3 rotations for spiral
 
-        // Vary radius slightly for depth
-        let radius_variation = 0.5 * ((i as f32 * 0.1).sin());
-        let r = base_radius + radius_variation;
+        // Distribute radius from inner to outer
+        let radius = inner_radius + (outer_radius - inner_radius) * t;
 
-        let sin_inc = inclination.sin();
-        let cos_inc = inclination.cos();
-        let sin_az = azimuth.sin();
-        let cos_az = azimuth.cos();
+        // Position in XZ plane (y = 0) with small vertical variation
+        let y_variation = 0.1 * ((i as f32 * 0.5).sin());
+        let x = radius * angle.cos();
+        let z = radius * angle.sin();
+        let y = y_variation;
 
-        let x = r * sin_inc * cos_az;
-        let y = r * sin_inc * sin_az;
-        let z = r * cos_inc;
-
-        // Small tangential velocity for initial rotation (creates galaxy-like motion)
-        let tangent_speed = 0.1;
-        let vx = -tangent_speed * sin_az;
-        let vy = tangent_speed * cos_az;
-        let vz = 0.0;
+        // Tangential velocity (perpendicular to radius in XZ plane)
+        // Scale velocity with sqrt(1/radius) for Keplerian-ish motion
+        let speed = base_orbital_speed * (1.0 / radius).sqrt();
+        let vx = -speed * angle.sin(); // Perpendicular to radius
+        let vz = speed * angle.cos();
+        let vy = 0.0;
 
         particles.push(Particle {
             position: [x, y, z],
@@ -736,7 +855,8 @@ struct State {
     line_vertex_count: u32,
     // Particle system (compute + render)
     particle_buffers: [wgpu::Buffer; 2],  // Double-buffered for ping-pong
-    particle_count: u32,
+    active_particle_count: u32,           // Current number of active particles
+    max_particles: u32,                   // Buffer capacity
     compute_pipeline: wgpu::ComputePipeline,
     compute_bind_groups: [wgpu::BindGroup; 2],
     sim_params_buffer: wgpu::Buffer,
@@ -998,33 +1118,45 @@ impl State {
 
         // Create initial particles
         let initial_particles = create_initial_particles(PARTICLE_COUNT);
-        let particle_count = initial_particles.len() as u32;
+        let active_particle_count = initial_particles.len() as u32;
 
         // Buffer usage for compute-render sharing
         let particle_buffer_usage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::VERTEX
             | wgpu::BufferUsages::COPY_DST;
 
+        // Pre-allocate buffers for MAX_PARTICLES capacity
+        let buffer_size = (MAX_PARTICLES as usize) * std::mem::size_of::<Particle>();
+
         // Create double-buffered particle storage (ping-pong pattern)
+        // Initialize with zeros, then write initial particles
         let particle_buffers = [
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Particle Buffer 0"),
-                contents: bytemuck::cast_slice(&initial_particles),
+                size: buffer_size as u64,
                 usage: particle_buffer_usage,
+                mapped_at_creation: false,
             }),
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Particle Buffer 1"),
-                contents: bytemuck::cast_slice(&initial_particles),
+                size: buffer_size as u64,
                 usage: particle_buffer_usage,
+                mapped_at_creation: false,
             }),
         ];
+
+        // Write initial particles to both buffers
+        queue.write_buffer(&particle_buffers[0], 0, bytemuck::cast_slice(&initial_particles));
+        queue.write_buffer(&particle_buffers[1], 0, bytemuck::cast_slice(&initial_particles));
 
         // Create simulation parameters uniform buffer
         let sim_params = SimParams {
             delta_time: 1.0 / 60.0,
-            gravity_strength: GRAVITY_STRENGTH,
+            gravitational_constant: GRAVITATIONAL_CONSTANT,
             damping: DAMPING,
-            particle_count,
+            particle_count: active_particle_count,
+            softening_sq: SOFTENING_SQ,
+            _padding: [0.0; 3],
         };
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Simulation Params Buffer"),
@@ -1240,7 +1372,8 @@ impl State {
             line_vertex_buffer,
             line_vertex_count,
             particle_buffers,
-            particle_count,
+            active_particle_count,
+            max_particles: MAX_PARTICLES,
             compute_pipeline,
             compute_bind_groups,
             sim_params_buffer,
@@ -1271,6 +1404,35 @@ impl State {
         }
     }
 
+    /// Spawns a new particle at the given world position.
+    fn spawn_particle(&mut self, world_pos: Vec3) {
+        if self.active_particle_count >= self.max_particles {
+            return; // Buffer full
+        }
+
+        let particle = Particle {
+            position: [world_pos.x, world_pos.y, world_pos.z],
+            size: PARTICLE_SIZE,
+            velocity: [0.0, 0.0, 0.0],
+            _padding: 0.0,
+        };
+
+        // Write to both buffers at active_particle_count offset
+        let offset = (self.active_particle_count as usize) * std::mem::size_of::<Particle>();
+        self.queue.write_buffer(
+            &self.particle_buffers[0],
+            offset as u64,
+            bytemuck::bytes_of(&particle),
+        );
+        self.queue.write_buffer(
+            &self.particle_buffers[1],
+            offset as u64,
+            bytemuck::bytes_of(&particle),
+        );
+
+        self.active_particle_count += 1;
+    }
+
     /// Renders a single frame.
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         // Calculate delta time
@@ -1290,9 +1452,11 @@ impl State {
         // Update simulation parameters
         let sim_params = SimParams {
             delta_time: dt,
-            gravity_strength: GRAVITY_STRENGTH,
+            gravitational_constant: GRAVITATIONAL_CONSTANT,
             damping: DAMPING,
-            particle_count: self.particle_count,
+            particle_count: self.active_particle_count,
+            softening_sq: SOFTENING_SQ,
+            _padding: [0.0; 3],
         };
         self.queue.write_buffer(
             &self.sim_params_buffer,
@@ -1331,8 +1495,8 @@ impl State {
             });
             compute_pass.set_pipeline(&self.compute_pipeline);
             compute_pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
-            // Dispatch workgroups: ceil(particle_count / 256)
-            let workgroup_count = (self.particle_count + 255) / 256;
+            // Dispatch workgroups: ceil(active_particle_count / 256)
+            let workgroup_count = (self.active_particle_count + 255) / 256;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
         // Implicit memory barrier here - wgpu ensures compute writes complete before render reads
@@ -1380,7 +1544,7 @@ impl State {
             render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, self.particle_buffers[write_idx].slice(..));
             render_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..6, 0, 0..self.particle_count);
+            render_pass.draw_indexed(0..6, 0, 0..self.active_particle_count);
 
             // Draw spheres (instanced icosphere)
             render_pass.set_pipeline(&self.sphere_pipeline);
@@ -1463,14 +1627,43 @@ pub async fn init_webgpu(canvas_id: &str) -> Result<(), JsValue> {
 /// Called from JavaScript via requestAnimationFrame.
 #[wasm_bindgen]
 pub fn render() -> Result<(), JsValue> {
-    // Get input deltas and apply to camera
-    let (rotate, zoom) = INPUT_STATE.with(|input| input.borrow_mut().take_deltas());
+    // Get input deltas and pending spawn
+    let (rotate, zoom, pending_spawn) = INPUT_STATE.with(|input| {
+        let mut input = input.borrow_mut();
+        let deltas = input.take_deltas();
+        let spawn = input.take_pending_spawn();
+        (deltas.0, deltas.1, spawn)
+    });
 
     STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         if let Some(state) = state_ref.as_mut() {
             // Update camera from input
             state.update_camera(rotate, zoom);
+
+            // Handle click-to-spawn
+            if let Some((screen_x, screen_y)) = pending_spawn {
+                let (width, height) = state.size;
+                let (ray_origin, ray_dir) = screen_to_world_ray(
+                    screen_x,
+                    screen_y,
+                    width,
+                    height,
+                    &state.camera,
+                    &state.projection,
+                );
+
+                // Intersect ray with plane through camera target, facing camera
+                let plane_normal = (state.camera.eye() - state.camera.target).normalize();
+                if let Some(world_pos) = ray_plane_intersection(
+                    ray_origin,
+                    ray_dir,
+                    state.camera.target,
+                    plane_normal,
+                ) {
+                    state.spawn_particle(world_pos);
+                }
+            }
 
             match state.render() {
                 Ok(()) => {}
