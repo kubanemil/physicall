@@ -84,6 +84,35 @@ body {
   background: #5a5a9a;
 }
 
+.reset-group {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.reset-group button {
+  flex: 1;
+  margin-bottom: 0 !important;
+}
+
+.reset-group input[type="number"] {
+  width: 4.5rem;
+  padding: 0.4rem 0.4rem;
+  border: none;
+  border-radius: 4px;
+  background: #2a2a4a;
+  color: #0f9;
+  font-size: 0.85rem;
+  font-weight: bold;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.reset-group input[type="number"]::-webkit-inner-spin-button,
+.reset-group input[type="number"]::-webkit-outer-spin-button {
+  opacity: 0.5;
+}
+
 .slider-group {
   margin-top: 0.75rem;
 }

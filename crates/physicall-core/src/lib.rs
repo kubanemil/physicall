@@ -629,17 +629,26 @@ struct SimParams {
     dragged_particle_idx: i32,
     hovered_particle_idx: i32,
     drag_target: [f32; 3],
+    restitution: f32,
+    floor_y: f32,
+    cell_size: f32,
+    num_cells: u32,
     _padding: f32,
 }
 
 /// Physics simulation constants for N-body simulation
-const PARTICLE_COUNT: u32 = 200;          // Reduced for N-body O(n²) performance
+const PARTICLE_COUNT: u32 = 500;          // Increased with spatial hash collision
 const MAX_PARTICLES: u32 = 2_000;         // Pre-allocated buffer capacity
 const PARTICLE_SIZE: f32 = 0.03;          // Larger for fewer particles
 const GRAVITATIONAL_CONSTANT: f32 = 0.3;  // Tunable G (lower for stability)
 const SOFTENING_SQ: f32 = 0.1;            // Prevents singularity at close range
 const DAMPING: f32 = 1.0;                 // No damping for orbital conservation
 const DRAG_STRENGTH: f32 = 50.0;          // Spring force multiplier for mouse drag
+const RESTITUTION: f32 = 0.8;             // Slightly inelastic collisions
+const FLOOR_Y: f32 = -2.0;               // Floor boundary y-coordinate
+const NUM_CELLS: u32 = 4096;             // Spatial hash table size (power of 2)
+const MAX_PER_CELL: u32 = 16;            // Max particles per hash cell bucket
+const CELL_SIZE: f32 = 2.0 * PARTICLE_SIZE; // Grid cell size (0.06)
 
 /// Creates initial particles in a ring distribution for N-body simulation.
 /// Particles are arranged in a disk in the XZ plane with tangential velocities
@@ -935,7 +944,12 @@ struct State {
     active_particle_count: u32,           // Current number of active particles
     max_particles: u32,                   // Buffer capacity
     compute_pipeline: wgpu::ComputePipeline,
+    hash_clear_pipeline: wgpu::ComputePipeline,
+    hash_insert_pipeline: wgpu::ComputePipeline,
     compute_bind_groups: [wgpu::BindGroup; 2],
+    hash_bind_group: wgpu::BindGroup,
+    cell_count_buffer: wgpu::Buffer,
+    cell_entries_buffer: wgpu::Buffer,
     sim_params_buffer: wgpu::Buffer,
     frame_index: u32,
     last_frame_time: Option<f64>,
@@ -1149,6 +1163,10 @@ impl State {
             dragged_particle_idx: -1,
             hovered_particle_idx: -1,
             drag_target: [0.0; 3],
+            restitution: RESTITUTION,
+            floor_y: FLOOR_Y,
+            cell_size: CELL_SIZE,
+            num_cells: NUM_CELLS,
             _padding: 0.0,
         };
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1315,7 +1333,7 @@ impl State {
         queue.write_buffer(&particle_buffers[0], 0, bytemuck::cast_slice(&initial_particles));
         queue.write_buffer(&particle_buffers[1], 0, bytemuck::cast_slice(&initial_particles));
 
-        // Create compute bind group layout
+        // Create compute bind group layout (group 0: particles + sim_params)
         let compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Compute Bind Group Layout"),
@@ -1356,23 +1374,95 @@ impl State {
                 ],
             });
 
-        // Create compute pipeline layout
+        // Create hash bind group layout (group 1: spatial hash data)
+        let hash_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Hash Bind Group Layout"),
+                entries: &[
+                    // Binding 0: Cell counts (read_write for clear/insert, read for physics)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Binding 1: Cell entries (read_write for insert, read for physics)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Create spatial hash GPU buffers
+        let cell_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell Count Buffer"),
+            size: (NUM_CELLS * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cell_entries_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cell Entries Buffer"),
+            size: (NUM_CELLS * MAX_PER_CELL * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Create hash bind group
+        let hash_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Hash Bind Group"),
+            layout: &hash_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: cell_count_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: cell_entries_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Shared compute pipeline layout: [compute_group, hash_group]
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Compute Pipeline Layout"),
-                bind_group_layouts: &[&compute_bind_group_layout],
+                bind_group_layouts: &[&compute_bind_group_layout, &hash_bind_group_layout],
                 ..Default::default()
             });
 
-        // Load compute shader
+        // Load shaders
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Particle Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("../../../shaders/particle_compute.wgsl").into(),
             ),
         });
+        let hash_clear_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hash Clear Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/hash_clear.wgsl").into(),
+            ),
+        });
+        let hash_insert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Hash Insert Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/hash_insert.wgsl").into(),
+            ),
+        });
 
-        // Create compute pipeline
+        // Create compute pipelines (all share the same 2-group layout)
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Particle Compute Pipeline"),
             layout: Some(&compute_pipeline_layout),
@@ -1381,8 +1471,24 @@ impl State {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let hash_clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Hash Clear Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &hash_clear_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let hash_insert_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Hash Insert Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &hash_insert_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
 
-        // Create two bind groups for ping-pong pattern
+        // Create two bind groups for ping-pong pattern (group 0)
         // bind_group_0: read from buffer[0], write to buffer[1]
         // bind_group_1: read from buffer[1], write to buffer[0]
         let compute_bind_groups = [
@@ -1526,7 +1632,12 @@ impl State {
             active_particle_count,
             max_particles: MAX_PARTICLES,
             compute_pipeline,
+            hash_clear_pipeline,
+            hash_insert_pipeline,
             compute_bind_groups,
+            hash_bind_group,
+            cell_count_buffer,
+            cell_entries_buffer,
             sim_params_buffer,
             frame_index: 0,
             last_frame_time: None,
@@ -1731,6 +1842,10 @@ impl State {
             dragged_particle_idx: drag_idx,
             hovered_particle_idx: hover_idx,
             drag_target: drag_tgt,
+            restitution: RESTITUTION,
+            floor_y: FLOOR_Y,
+            cell_size: CELL_SIZE,
+            num_cells: NUM_CELLS,
             _padding: 0.0,
         };
         self.queue.write_buffer(
@@ -1762,17 +1877,46 @@ impl State {
         let read_idx = (self.frame_index % 2) as usize;
         let write_idx = ((self.frame_index + 1) % 2) as usize;
 
-        // Compute pass: update particle positions (skip when paused)
+        // Compute passes: spatial hash build + physics (skip when paused)
         if !self.paused {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Particle Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
-            // Dispatch workgroups: ceil(active_particle_count / 256)
-            let workgroup_count = (self.active_particle_count + 255) / 256;
-            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+            let particle_workgroups = (self.active_particle_count + 255) / 256;
+            let hash_workgroups = (NUM_CELLS + 255) / 256;
+
+            // Pass 1: Clear spatial hash
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hash Clear Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.hash_clear_pipeline);
+                pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
+                pass.set_bind_group(1, &self.hash_bind_group, &[]);
+                pass.dispatch_workgroups(hash_workgroups, 1, 1);
+            }
+
+            // Pass 2: Insert particles into hash
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Hash Insert Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.hash_insert_pipeline);
+                pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
+                pass.set_bind_group(1, &self.hash_bind_group, &[]);
+                pass.dispatch_workgroups(particle_workgroups, 1, 1);
+            }
+
+            // Pass 3: N-body gravity + hash-based collision + integration
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Physics Compute Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.compute_pipeline);
+                pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
+                pass.set_bind_group(1, &self.hash_bind_group, &[]);
+                pass.dispatch_workgroups(particle_workgroups, 1, 1);
+            }
         }
         // Implicit memory barrier here - wgpu ensures compute writes complete before render reads
 
@@ -1853,18 +1997,28 @@ impl State {
         self.camera.zoom(zoom * ZOOM_SPEED);
     }
 
-    /// Resets the simulation to its initial state.
-    fn reset_simulation(&mut self) {
-        // Write initial particles to both buffers
+    /// Resets the simulation, optionally with a new particle count.
+    fn reset_simulation(&mut self, count: Option<u32>) {
+        let particles = if let Some(c) = count {
+            let c = c.min(self.max_particles);
+            let new_particles = create_initial_particles(c);
+            self.initial_particles = new_particles.clone();
+            self.initial_particle_count = c;
+            new_particles
+        } else {
+            self.initial_particles.clone()
+        };
+
+        // Write particles to both buffers
         self.queue.write_buffer(
             &self.particle_buffers[0],
             0,
-            bytemuck::cast_slice(&self.initial_particles),
+            bytemuck::cast_slice(&particles),
         );
         self.queue.write_buffer(
             &self.particle_buffers[1],
             0,
-            bytemuck::cast_slice(&self.initial_particles),
+            bytemuck::cast_slice(&particles),
         );
 
         // Reset particle count and frame index
@@ -1872,7 +2026,7 @@ impl State {
         self.frame_index = 0;
 
         // Reset CPU positions
-        self.particle_positions = self.initial_particles
+        self.particle_positions = particles
             .iter()
             .map(|p| Vec3::new(p.position[0], p.position[1], p.position[2]))
             .collect();
@@ -2115,7 +2269,26 @@ pub fn reset_simulation() {
     STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         if let Some(state) = state_ref.as_mut() {
-            state.reset_simulation();
+            state.reset_simulation(None);
+        }
+    });
+}
+
+/// Resets the simulation with a new particle count.
+/// Count is clamped to [1, MAX_PARTICLES].
+#[wasm_bindgen]
+pub fn reset_simulation_with_count(count: u32) {
+    INPUT_STATE.with(|input| {
+        let mut input = input.borrow_mut();
+        input.dragging_particle_idx = None;
+        input.pending_pick = None;
+        input.pending_delete = None;
+    });
+
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.reset_simulation(Some(count.max(1)));
         }
     });
 }

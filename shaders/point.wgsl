@@ -1,5 +1,5 @@
-// Point shader - renders instanced quads as circular points
-// Each point is a quad (2 triangles) with fragment discard for circular shape
+// Point shader - renders instanced quads as sphere impostors
+// Each point is a billboard quad with sphere lighting in the fragment shader
 // Color is derived from velocity magnitude (slow=blue, fast=red)
 // Hovered/dragged particles are highlighted
 
@@ -17,6 +17,10 @@ struct SimParams {
     dragged_particle_idx: i32,
     hovered_particle_idx: i32,
     drag_target: vec3f,
+    restitution: f32,
+    floor_y: f32,
+    cell_size: f32,
+    num_cells: u32,
     _padding: f32,
 }
 
@@ -48,16 +52,18 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(quad: QuadInput, instance: InstanceInput) -> VertexOutput {
-    // Axis-aligned quad: expand in world XY plane
-    let world_pos = vec3f(
-        instance.world_pos.x + quad.quad_pos.x * instance.size,
-        instance.world_pos.y + quad.quad_pos.y * instance.size,
-        instance.world_pos.z,
-    );
+    // Billboard quad: expand in view-aligned XY using view_proj columns
+    // Extract right and up vectors from view_proj for billboarding
+    let right = normalize(vec3f(camera.view_proj[0][0], camera.view_proj[1][0], camera.view_proj[2][0]));
+    let up = normalize(vec3f(camera.view_proj[0][1], camera.view_proj[1][1], camera.view_proj[2][1]));
+
+    let world_pos = instance.world_pos
+        + right * quad.quad_pos.x * instance.size
+        + up * quad.quad_pos.y * instance.size;
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4f(world_pos, 1.0);
-    out.uv = quad.quad_pos * 0.5 + 0.5;  // Convert -1..1 to 0..1
+    out.uv = quad.quad_pos;  // Keep in -1..1 range for sphere normal calculation
     out.velocity = instance.velocity;
     out.instance_idx = quad.instance_idx;
     return out;
@@ -65,28 +71,43 @@ fn vs_main(quad: QuadInput, instance: InstanceInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    // Discard fragments outside the circle (radius 0.5 from center)
-    let dist = length(in.uv - vec2f(0.5));
-    if (dist > 0.5) {
+    // Discard fragments outside the unit circle
+    let len_sq = dot(in.uv, in.uv);
+    if (len_sq > 1.0) {
         discard;
     }
 
+    // Compute sphere normal from UV (treating quad as hemisphere projection)
+    let nz = sqrt(1.0 - len_sq);
+    let normal = vec3f(in.uv.x, in.uv.y, nz);
+
+    // Simple directional light from upper-right-front
+    let light_dir = normalize(vec3f(0.4, 0.7, 0.6));
+    let diffuse = max(dot(normal, light_dir), 0.0);
+    let ambient = 0.15;
+
+    // Specular highlight (Blinn-Phong)
+    let view_dir = vec3f(0.0, 0.0, 1.0); // billboard faces camera
+    let half_dir = normalize(light_dir + view_dir);
+    let specular = pow(max(dot(normal, half_dir), 0.0), 32.0) * 0.4;
+
     // Velocity-based coloring: slow (blue) to fast (red/orange)
     let speed = length(in.velocity);
-    let t = saturate(speed * 5.0);  // Normalize speed, adjust multiplier as needed
+    let t = saturate(speed * 5.0);
     let slow_color = vec3f(0.2, 0.4, 1.0);   // Blue
     let fast_color = vec3f(1.0, 0.3, 0.1);   // Red/orange
-    var color = mix(slow_color, fast_color, t);
+    var base_color = mix(slow_color, fast_color, t);
 
     // Highlight hovered or dragged particle
     let idx = i32(in.instance_idx);
     if (idx == sim_params.dragged_particle_idx) {
-        // Dragged: bright white highlight
-        color = mix(color, vec3f(1.0, 1.0, 1.0), 0.6);
+        base_color = mix(base_color, vec3f(1.0, 1.0, 1.0), 0.6);
     } else if (idx == sim_params.hovered_particle_idx) {
-        // Hovered: subtle white highlight
-        color = mix(color, vec3f(1.0, 1.0, 1.0), 0.3);
+        base_color = mix(base_color, vec3f(1.0, 1.0, 1.0), 0.3);
     }
+
+    // Combine lighting
+    let color = base_color * (ambient + diffuse) + vec3f(specular);
 
     return vec4f(color, 1.0);
 }

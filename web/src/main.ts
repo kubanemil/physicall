@@ -5,6 +5,7 @@ import init, {
   reset_camera,
   set_paused,
   reset_simulation,
+  reset_simulation_with_count,
   set_gravity,
   set_time_scale,
   get_particle_count,
@@ -130,6 +131,7 @@ function setupResizeObserver(): void {
 function setupUIControls(): void {
   const pauseBtn = document.getElementById('pause-btn') as HTMLButtonElement;
   const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
+  const particleCountInput = document.getElementById('particle-count-input') as HTMLInputElement;
   const gravitySlider = document.getElementById('gravity-slider') as HTMLInputElement;
   const gravityValue = document.getElementById('gravity-value') as HTMLSpanElement;
   const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
@@ -148,9 +150,14 @@ function setupUIControls(): void {
     }
   });
 
-  // Reset button
+  // Reset button — uses particle count from input
   resetBtn.addEventListener('click', () => {
-    reset_simulation();
+    const count = parseInt(particleCountInput.value, 10);
+    if (count > 0) {
+      reset_simulation_with_count(count);
+    } else {
+      reset_simulation();
+    }
   });
 
   // Gravity slider
