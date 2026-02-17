@@ -1,4 +1,14 @@
-import init, { init_webgpu, render, resize, reset_camera } from '../../crates/physicall-core/pkg/physicall_core';
+import init, {
+  init_webgpu,
+  render,
+  resize,
+  reset_camera,
+  set_paused,
+  reset_simulation,
+  set_gravity,
+  set_time_scale,
+  get_particle_count,
+} from '../../crates/physicall-core/pkg/physicall_core';
 
 interface WebGPUCheckResult {
   supported: boolean;
@@ -84,6 +94,9 @@ const canvas = document.getElementById('canvas') as HTMLCanvasElement;
 let pendingWidth: number | null = null;
 let pendingHeight: number | null = null;
 
+// UI state
+let isPaused = false;
+
 function setupResizeObserver(): void {
   const observer = new ResizeObserver((entries) => {
     const entry = entries[0];
@@ -114,7 +127,60 @@ function setupResizeObserver(): void {
   }
 }
 
-function renderLoop(): void {
+function setupUIControls(): void {
+  const pauseBtn = document.getElementById('pause-btn') as HTMLButtonElement;
+  const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
+  const gravitySlider = document.getElementById('gravity-slider') as HTMLInputElement;
+  const gravityValue = document.getElementById('gravity-value') as HTMLSpanElement;
+  const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
+  const speedValue = document.getElementById('speed-value') as HTMLSpanElement;
+  const pausedOverlay = document.getElementById('paused-overlay') as HTMLDivElement;
+
+  // Pause/Resume button
+  pauseBtn.addEventListener('click', () => {
+    isPaused = !isPaused;
+    set_paused(isPaused);
+    pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
+    if (isPaused) {
+      pausedOverlay.classList.remove('hidden');
+    } else {
+      pausedOverlay.classList.add('hidden');
+    }
+  });
+
+  // Reset button
+  resetBtn.addEventListener('click', () => {
+    reset_simulation();
+  });
+
+  // Gravity slider
+  gravitySlider.addEventListener('input', () => {
+    const value = parseFloat(gravitySlider.value);
+    set_gravity(value);
+    gravityValue.textContent = value.toFixed(1);
+  });
+
+  // Speed slider
+  speedSlider.addEventListener('input', () => {
+    const value = parseFloat(speedSlider.value);
+    set_time_scale(value);
+    speedValue.textContent = value.toFixed(1);
+  });
+}
+
+// Stats display state
+let lastFrameTimestamp = 0;
+let smoothedFps = 0;
+let smoothedFrameTime = 0;
+let lastDisplayUpdate = 0;
+let fpsValue: HTMLSpanElement | null = null;
+let frametimeValue: HTMLSpanElement | null = null;
+let statsParticleCount: HTMLSpanElement | null = null;
+
+const EMA_ALPHA = 0.1;
+const DISPLAY_INTERVAL = 500; // ms
+
+function renderLoop(timestamp: DOMHighResTimeStamp): void {
   // Apply pending resize before rendering
   if (pendingWidth !== null && pendingHeight !== null) {
     if (pendingWidth > 0 && pendingHeight > 0) {
@@ -127,6 +193,24 @@ function renderLoop(): void {
   }
 
   render();
+
+  // FPS / frame time tracking
+  if (lastFrameTimestamp > 0) {
+    const frameTime = timestamp - lastFrameTimestamp;
+    const fps = 1000 / frameTime;
+    smoothedFps = smoothedFps === 0 ? fps : smoothedFps * (1 - EMA_ALPHA) + fps * EMA_ALPHA;
+    smoothedFrameTime = smoothedFrameTime === 0 ? frameTime : smoothedFrameTime * (1 - EMA_ALPHA) + frameTime * EMA_ALPHA;
+  }
+  lastFrameTimestamp = timestamp;
+
+  // Throttled DOM update every 500ms
+  if (timestamp - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+    lastDisplayUpdate = timestamp;
+    if (fpsValue) fpsValue.textContent = smoothedFps > 0 ? String(Math.round(smoothedFps)) : '--';
+    if (frametimeValue) frametimeValue.textContent = smoothedFrameTime > 0 ? smoothedFrameTime.toFixed(1) : '--';
+    if (statsParticleCount) statsParticleCount.textContent = String(get_particle_count());
+  }
+
   requestAnimationFrame(renderLoop);
 }
 
@@ -153,10 +237,26 @@ async function main() {
   // Set up resize observer for responsive canvas
   setupResizeObserver();
 
-  // Set up keyboard handler for camera reset
+  // Set up UI controls
+  setupUIControls();
+
+  // Set up stats display references
+  fpsValue = document.getElementById('fps-value') as HTMLSpanElement;
+  frametimeValue = document.getElementById('frametime-value') as HTMLSpanElement;
+  statsParticleCount = document.getElementById('stats-particle-count') as HTMLSpanElement;
+
+  // Set up keyboard handlers
+  const statsPanel = document.getElementById('stats') as HTMLDivElement;
+  let statsVisible = true;
+
   document.addEventListener('keydown', (e) => {
     if (e.key === 'r' || e.key === 'R') {
       reset_camera();
+    }
+    if (e.ctrlKey && (e.key === 'y' || e.key === 'Y')) {
+      e.preventDefault();
+      statsVisible = !statsVisible;
+      statsPanel.classList.toggle('hidden', !statsVisible);
     }
   });
 

@@ -226,6 +226,43 @@ fn ray_plane_intersection(
     Some(ray_origin + ray_dir * t)
 }
 
+/// Computes ray-sphere intersection.
+/// Returns the distance to the nearest intersection point, or None if no hit.
+fn ray_sphere_intersection(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    sphere_center: Vec3,
+    sphere_radius: f32,
+) -> Option<f32> {
+    // Vector from ray origin to sphere center
+    let oc = ray_origin - sphere_center;
+
+    // Quadratic coefficients: at² + bt + c = 0
+    let a = ray_dir.dot(ray_dir);
+    let b = 2.0 * oc.dot(ray_dir);
+    let c = oc.dot(oc) - sphere_radius * sphere_radius;
+
+    let discriminant = b * b - 4.0 * a * c;
+
+    if discriminant < 0.0 {
+        return None; // No intersection
+    }
+
+    let sqrt_disc = discriminant.sqrt();
+
+    // Find the nearest positive root
+    let t1 = (-b - sqrt_disc) / (2.0 * a);
+    let t2 = (-b + sqrt_disc) / (2.0 * a);
+
+    if t1 > 0.0 {
+        Some(t1)
+    } else if t2 > 0.0 {
+        Some(t2)
+    } else {
+        None // Both intersections behind ray origin
+    }
+}
+
 // ============================================================================
 // Input Handling
 // ============================================================================
@@ -244,6 +281,11 @@ struct InputState {
     mouse_down_pos: Option<(i32, i32)>,  // Position at mousedown
     pending_spawn: Option<(f32, f32)>,   // Screen coords for spawn (client coords)
     total_drag_distance: i32,            // Accumulated movement since mousedown
+    // Particle interaction
+    pending_pick: Option<(f32, f32)>,          // Screen pos for pick test on mousedown
+    dragging_particle_idx: Option<u32>,        // Currently dragged particle index
+    current_mouse_screen_pos: Option<(f32, f32)>, // Current mouse position for drag & hover
+    pending_delete: Option<(f32, f32)>,        // Screen coords for middle-click delete
 }
 
 impl InputState {
@@ -257,6 +299,10 @@ impl InputState {
             mouse_down_pos: None,
             pending_spawn: None,
             total_drag_distance: 0,
+            pending_pick: None,
+            dragging_particle_idx: None,
+            current_mouse_screen_pos: None,
+            pending_delete: None,
         }
     }
 
@@ -280,41 +326,60 @@ thread_local! {
     static INPUT_STATE: Rc<RefCell<InputState>> = Rc::new(RefCell::new(InputState::new()));
 }
 
-/// Set up mouse event listeners for camera control and click-to-spawn.
+/// Set up mouse event listeners for camera control, click-to-spawn, and particle interaction.
 fn setup_mouse_events(
     canvas: &HtmlCanvasElement,
     state: Rc<RefCell<InputState>>,
 ) -> Result<(), JsValue> {
-    // Mousedown - start dragging and record position for click detection
+    // Prevent context menu on right-click to allow middle-click detection
+    {
+        let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
+            event.prevent_default();
+        });
+        canvas.add_event_listener_with_callback("contextmenu", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    // Mousedown - start dragging, record position, set up pick/delete
     {
         let state = state.clone();
         let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
-            if event.button() == 0 {
-                // Left button
-                let mut s = state.borrow_mut();
+            let mut s = state.borrow_mut();
+            let button = event.button();
+
+            if button == 0 {
+                // Left button - camera orbit or particle drag
                 s.is_dragging = true;
                 s.last_x = event.client_x();
                 s.last_y = event.client_y();
-                // Record canvas-relative position for click detection (offset_x/y)
                 s.mouse_down_pos = Some((event.offset_x(), event.offset_y()));
                 s.total_drag_distance = 0;
+                // Set pending pick for render loop to determine if we clicked a particle
+                s.pending_pick = Some((event.offset_x() as f32, event.offset_y() as f32));
+            } else if button == 1 {
+                // Middle button - delete particle
+                event.prevent_default();
+                s.pending_delete = Some((event.offset_x() as f32, event.offset_y() as f32));
             }
         });
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
 
-    // Mousemove - accumulate rotation delta while dragging
+    // Mousemove - accumulate rotation delta and track mouse position
     {
         let state = state.clone();
         let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
             let mut s = state.borrow_mut();
+            // Always update mouse position for hover detection and drag target
+            s.current_mouse_screen_pos = Some((event.offset_x() as f32, event.offset_y() as f32));
+
             if s.is_dragging {
                 let dx = event.client_x() - s.last_x;
                 let dy = event.client_y() - s.last_y;
+                // Accumulate camera rotation (ignored if particle dragging)
                 s.rotate_delta.0 += dx as f32;
                 s.rotate_delta.1 += dy as f32;
-                // Track total drag distance for click detection
                 s.total_drag_distance += dx.abs() + dy.abs();
                 s.last_x = event.client_x();
                 s.last_y = event.client_y();
@@ -324,29 +389,34 @@ fn setup_mouse_events(
         closure.forget();
     }
 
-    // Mouseup - stop dragging and detect clicks
+    // Mouseup - stop dragging, detect clicks, release particle
     {
         let state = state.clone();
         let closure = Closure::<dyn FnMut(_)>::new(move |event: MouseEvent| {
+            if event.button() != 0 {
+                return; // Only handle left button release
+            }
             let mut s = state.borrow_mut();
             if s.is_dragging {
                 s.is_dragging = false;
-                // Check if this was a click (minimal movement)
-                if s.total_drag_distance < CLICK_THRESHOLD {
+
+                if s.dragging_particle_idx.is_some() {
+                    // Was dragging a particle - release it (momentum preserved by physics)
+                    s.dragging_particle_idx = None;
+                } else if s.total_drag_distance < CLICK_THRESHOLD {
+                    // Was a click on empty space - spawn particle
                     if let Some((down_x, down_y)) = s.mouse_down_pos {
-                        // Use the canvas-relative mousedown position for spawning
                         s.pending_spawn = Some((down_x as f32, down_y as f32));
                     }
                 }
                 s.mouse_down_pos = None;
             }
         });
-        // Listen on canvas instead of window to get correct coordinates
         canvas.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
 
-    // Also listen on window for mouseup outside canvas (just to stop dragging)
+    // Also listen on window for mouseup outside canvas
     {
         let state = state.clone();
         let window = web_sys::window().expect("No window");
@@ -354,6 +424,7 @@ fn setup_mouse_events(
             let mut s = state.borrow_mut();
             s.is_dragging = false;
             s.mouse_down_pos = None;
+            s.dragging_particle_idx = None;
         });
         window.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
         closure.forget();
@@ -545,15 +616,20 @@ impl Particle {
 }
 
 /// Simulation parameters uniform buffer.
+/// Layout must match SimParams in particle_compute.wgsl and point.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SimParams {
     delta_time: f32,
-    gravitational_constant: f32,  // G - gravitational constant for N-body
+    gravitational_constant: f32,
     damping: f32,
     particle_count: u32,
-    softening_sq: f32,            // epsilon² - prevents singularity at r=0
-    _padding: [f32; 3],
+    softening_sq: f32,
+    drag_strength: f32,
+    dragged_particle_idx: i32,
+    hovered_particle_idx: i32,
+    drag_target: [f32; 3],
+    _padding: f32,
 }
 
 /// Physics simulation constants for N-body simulation
@@ -563,6 +639,7 @@ const PARTICLE_SIZE: f32 = 0.03;          // Larger for fewer particles
 const GRAVITATIONAL_CONSTANT: f32 = 0.3;  // Tunable G (lower for stability)
 const SOFTENING_SQ: f32 = 0.1;            // Prevents singularity at close range
 const DAMPING: f32 = 1.0;                 // No damping for orbital conservation
+const DRAG_STRENGTH: f32 = 50.0;          // Spring force multiplier for mouse drag
 
 /// Creates initial particles in a ring distribution for N-body simulation.
 /// Particles are arranged in a disk in the XZ plane with tangential velocities
@@ -873,6 +950,20 @@ struct State {
     sphere_index_count: u32,
     sphere_instance_buffer: wgpu::Buffer,
     sphere_instance_count: u32,
+    // UI Controls state
+    paused: bool,
+    gravity: f32,
+    time_scale: f32,
+    initial_particles: Vec<Particle>,
+    initial_particle_count: u32,
+    // CPU-side particle positions for picking
+    particle_positions: Vec<Vec3>,
+    // Particle interaction state
+    hovered_particle_idx: Option<u32>,
+    dragged_particle_idx: Option<u32>,
+    drag_target: Option<Vec3>,
+    // Point rendering bind group (includes camera + sim_params)
+    point_bind_group: wgpu::BindGroup,
 }
 
 impl State {
@@ -1044,6 +1135,79 @@ impl State {
         let line_vertex_count = LINE_VERTICES.len() as u32;
 
         // ====================================================================
+        // Simulation Parameters (needed by point pipeline)
+        // ====================================================================
+
+        // Create simulation parameters uniform buffer
+        let sim_params = SimParams {
+            delta_time: 1.0 / 60.0,
+            gravitational_constant: GRAVITATIONAL_CONSTANT,
+            damping: DAMPING,
+            particle_count: PARTICLE_COUNT,
+            softening_sq: SOFTENING_SQ,
+            drag_strength: 0.0,
+            dragged_particle_idx: -1,
+            hovered_particle_idx: -1,
+            drag_target: [0.0; 3],
+            _padding: 0.0,
+        };
+        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Simulation Params Buffer"),
+            contents: bytemuck::cast_slice(&[sim_params]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create point bind group layout (camera + sim_params for point shader)
+        let point_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Point Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let point_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Point Bind Group"),
+            layout: &point_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sim_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let point_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Point Pipeline Layout"),
+                bind_group_layouts: &[&point_bind_group_layout],
+                ..Default::default()
+            });
+
+        // ====================================================================
         // Point Pipeline Setup (Instanced Quads)
         // ====================================================================
 
@@ -1056,7 +1220,7 @@ impl State {
         // Create point render pipeline with two vertex buffers (quad + particle instance)
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Point Pipeline"),
-            layout: Some(&pipeline_layout),
+            layout: Some(&point_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &point_shader,
                 entry_point: Some("vs_main"),
@@ -1116,14 +1280,16 @@ impl State {
         // Particle System Setup (Compute + Render Buffer Sharing)
         // ====================================================================
 
-        // Create initial particles
+        // Create initial particles (clone for reset capability)
         let initial_particles = create_initial_particles(PARTICLE_COUNT);
-        let active_particle_count = initial_particles.len() as u32;
+        let initial_particle_count = initial_particles.len() as u32;
+        let active_particle_count = initial_particle_count;
 
-        // Buffer usage for compute-render sharing
+        // Buffer usage for compute-render sharing (COPY_SRC needed for delete-by-swap)
         let particle_buffer_usage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::VERTEX
-            | wgpu::BufferUsages::COPY_DST;
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
 
         // Pre-allocate buffers for MAX_PARTICLES capacity
         let buffer_size = (MAX_PARTICLES as usize) * std::mem::size_of::<Particle>();
@@ -1148,21 +1314,6 @@ impl State {
         // Write initial particles to both buffers
         queue.write_buffer(&particle_buffers[0], 0, bytemuck::cast_slice(&initial_particles));
         queue.write_buffer(&particle_buffers[1], 0, bytemuck::cast_slice(&initial_particles));
-
-        // Create simulation parameters uniform buffer
-        let sim_params = SimParams {
-            delta_time: 1.0 / 60.0,
-            gravitational_constant: GRAVITATIONAL_CONSTANT,
-            damping: DAMPING,
-            particle_count: active_particle_count,
-            softening_sq: SOFTENING_SQ,
-            _padding: [0.0; 3],
-        };
-        let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Simulation Params Buffer"),
-            contents: bytemuck::cast_slice(&[sim_params]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
 
         // Create compute bind group layout
         let compute_bind_group_layout =
@@ -1388,6 +1539,22 @@ impl State {
             sphere_index_count,
             sphere_instance_buffer,
             sphere_instance_count,
+            // UI Controls state
+            paused: false,
+            gravity: GRAVITATIONAL_CONSTANT,
+            time_scale: 1.0,
+            initial_particles: initial_particles.clone(),
+            initial_particle_count,
+            // CPU-side particle positions for picking
+            particle_positions: initial_particles
+                .iter()
+                .map(|p| Vec3::new(p.position[0], p.position[1], p.position[2]))
+                .collect(),
+            // Particle interaction
+            hovered_particle_idx: None,
+            dragged_particle_idx: None,
+            drag_target: None,
+            point_bind_group,
         }
     }
 
@@ -1431,6 +1598,101 @@ impl State {
         );
 
         self.active_particle_count += 1;
+        self.particle_positions.push(world_pos);
+    }
+
+    /// Finds the nearest particle hit by a ray from the given screen coordinates.
+    /// Returns the particle index, or None if no particle was hit.
+    fn pick_particle(&self, screen_x: f32, screen_y: f32) -> Option<u32> {
+        let (width, height) = self.size;
+        let (ray_origin, ray_dir) = screen_to_world_ray(
+            screen_x, screen_y, width, height, &self.camera, &self.projection,
+        );
+
+        let pick_radius = PARTICLE_SIZE * 2.0;
+        let mut best_dist = f32::MAX;
+        let mut best_idx: Option<u32> = None;
+
+        for (i, pos) in self.particle_positions.iter().enumerate() {
+            if let Some(dist) = ray_sphere_intersection(ray_origin, ray_dir, *pos, pick_radius) {
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = Some(i as u32);
+                }
+            }
+        }
+
+        best_idx
+    }
+
+    /// Deletes a particle by swapping with the last particle (O(1)).
+    fn delete_particle(&mut self, idx: u32) {
+        if self.active_particle_count == 0 || idx >= self.active_particle_count {
+            return;
+        }
+
+        let last_idx = self.active_particle_count - 1;
+
+        if idx < last_idx {
+            // Copy last particle to deleted slot in both GPU buffers
+            let particle_size = std::mem::size_of::<Particle>() as u64;
+            let src_offset = last_idx as u64 * particle_size;
+            let dst_offset = idx as u64 * particle_size;
+
+            let mut encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor {
+                    label: Some("Delete Particle Encoder"),
+                },
+            );
+
+            encoder.copy_buffer_to_buffer(
+                &self.particle_buffers[0], src_offset,
+                &self.particle_buffers[0], dst_offset,
+                particle_size,
+            );
+            encoder.copy_buffer_to_buffer(
+                &self.particle_buffers[1], src_offset,
+                &self.particle_buffers[1], dst_offset,
+                particle_size,
+            );
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            // Update CPU positions: swap last into deleted slot
+            self.particle_positions[idx as usize] = self.particle_positions[last_idx as usize];
+        }
+
+        self.particle_positions.pop();
+        self.active_particle_count -= 1;
+    }
+
+    /// Directly sets a particle's position (used when paused + dragging).
+    fn update_particle_position_direct(&mut self, idx: u32, pos: Vec3) {
+        if idx >= self.active_particle_count {
+            return;
+        }
+
+        self.particle_positions[idx as usize] = pos;
+
+        // Create particle data with new position, zero velocity
+        let particle = Particle {
+            position: [pos.x, pos.y, pos.z],
+            size: PARTICLE_SIZE,
+            velocity: [0.0, 0.0, 0.0],
+            _padding: 0.0,
+        };
+
+        let offset = (idx as usize) * std::mem::size_of::<Particle>();
+        self.queue.write_buffer(
+            &self.particle_buffers[0],
+            offset as u64,
+            bytemuck::bytes_of(&particle),
+        );
+        self.queue.write_buffer(
+            &self.particle_buffers[1],
+            offset as u64,
+            bytemuck::bytes_of(&particle),
+        );
     }
 
     /// Renders a single frame.
@@ -1449,14 +1711,27 @@ impl State {
         // Clamp dt to avoid instability on lag spikes
         let dt = dt.min(1.0 / 30.0);
 
-        // Update simulation parameters
+        // Apply time scale and pause state
+        let effective_dt = if self.paused { 0.0 } else { dt * self.time_scale };
+
+        // Update simulation parameters with user-controllable values and drag/hover state
+        let (drag_idx, drag_str, drag_tgt) = match (self.dragged_particle_idx, self.drag_target) {
+            (Some(idx), Some(pos)) => (idx as i32, DRAG_STRENGTH, [pos.x, pos.y, pos.z]),
+            _ => (-1_i32, 0.0, [0.0; 3]),
+        };
+        let hover_idx = self.hovered_particle_idx.map(|i| i as i32).unwrap_or(-1);
+
         let sim_params = SimParams {
-            delta_time: dt,
-            gravitational_constant: GRAVITATIONAL_CONSTANT,
+            delta_time: effective_dt,
+            gravitational_constant: self.gravity,
             damping: DAMPING,
             particle_count: self.active_particle_count,
             softening_sq: SOFTENING_SQ,
-            _padding: [0.0; 3],
+            drag_strength: drag_str,
+            dragged_particle_idx: drag_idx,
+            hovered_particle_idx: hover_idx,
+            drag_target: drag_tgt,
+            _padding: 0.0,
         };
         self.queue.write_buffer(
             &self.sim_params_buffer,
@@ -1487,8 +1762,8 @@ impl State {
         let read_idx = (self.frame_index % 2) as usize;
         let write_idx = ((self.frame_index + 1) % 2) as usize;
 
-        // Compute pass: update particle positions
-        {
+        // Compute pass: update particle positions (skip when paused)
+        if !self.paused {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Particle Compute Pass"),
                 timestamp_writes: None,
@@ -1538,11 +1813,13 @@ impl State {
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
             render_pass.draw(0..self.line_vertex_count, 0..1);
 
-            // Draw particles (instanced quads) - read from the buffer just written by compute
+            // Draw particles (instanced quads)
+            // When paused, read from read_idx (no compute ran); otherwise read from write_idx
+            let particle_buffer_idx = if self.paused { read_idx } else { write_idx };
             render_pass.set_pipeline(&self.point_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.point_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.particle_buffers[write_idx].slice(..));
+            render_pass.set_vertex_buffer(1, self.particle_buffers[particle_buffer_idx].slice(..));
             render_pass.set_index_buffer(self.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..6, 0, 0..self.active_particle_count);
 
@@ -1558,8 +1835,10 @@ impl State {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        // Increment frame index for next frame's ping-pong
-        self.frame_index = self.frame_index.wrapping_add(1);
+        // Increment frame index for next frame's ping-pong (only when not paused)
+        if !self.paused {
+            self.frame_index = self.frame_index.wrapping_add(1);
+        }
 
         Ok(())
     }
@@ -1572,6 +1851,36 @@ impl State {
         self.camera.rotate_azimuth(-rotate.0 * ROTATE_SPEED);
         self.camera.rotate_polar(-rotate.1 * ROTATE_SPEED);
         self.camera.zoom(zoom * ZOOM_SPEED);
+    }
+
+    /// Resets the simulation to its initial state.
+    fn reset_simulation(&mut self) {
+        // Write initial particles to both buffers
+        self.queue.write_buffer(
+            &self.particle_buffers[0],
+            0,
+            bytemuck::cast_slice(&self.initial_particles),
+        );
+        self.queue.write_buffer(
+            &self.particle_buffers[1],
+            0,
+            bytemuck::cast_slice(&self.initial_particles),
+        );
+
+        // Reset particle count and frame index
+        self.active_particle_count = self.initial_particle_count;
+        self.frame_index = 0;
+
+        // Reset CPU positions
+        self.particle_positions = self.initial_particles
+            .iter()
+            .map(|p| Vec3::new(p.position[0], p.position[1], p.position[2]))
+            .collect();
+
+        // Clear interaction state
+        self.hovered_particle_idx = None;
+        self.dragged_particle_idx = None;
+        self.drag_target = None;
     }
 }
 
@@ -1627,48 +1936,109 @@ pub async fn init_webgpu(canvas_id: &str) -> Result<(), JsValue> {
 /// Called from JavaScript via requestAnimationFrame.
 #[wasm_bindgen]
 pub fn render() -> Result<(), JsValue> {
-    // Get input deltas and pending spawn
-    let (rotate, zoom, pending_spawn) = INPUT_STATE.with(|input| {
+    // Get all input state
+    let (rotate, zoom, pending_spawn, pending_pick, pending_delete,
+         current_mouse_pos, mut dragging_idx) = INPUT_STATE.with(|input| {
         let mut input = input.borrow_mut();
         let deltas = input.take_deltas();
         let spawn = input.take_pending_spawn();
-        (deltas.0, deltas.1, spawn)
+        let pick = input.pending_pick.take();
+        let delete = input.pending_delete.take();
+        let mouse_pos = input.current_mouse_screen_pos;
+        let dragging = input.dragging_particle_idx;
+        (deltas.0, deltas.1, spawn, pick, delete, mouse_pos, dragging)
     });
 
     STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         if let Some(state) = state_ref.as_mut() {
-            // Update camera from input
-            state.update_camera(rotate, zoom);
+            let mut suppress_spawn = false;
 
-            // Handle click-to-spawn
-            if let Some((screen_x, screen_y)) = pending_spawn {
-                let (width, height) = state.size;
-                let (ray_origin, ray_dir) = screen_to_world_ray(
-                    screen_x,
-                    screen_y,
-                    width,
-                    height,
-                    &state.camera,
-                    &state.projection,
-                );
+            // Process pending pick test (from mousedown)
+            if let Some((px, py)) = pending_pick {
+                if let Some(idx) = state.pick_particle(px, py) {
+                    // Clicked on a particle - start dragging
+                    dragging_idx = Some(idx);
+                    suppress_spawn = true;
+                    INPUT_STATE.with(|input| {
+                        let mut input = input.borrow_mut();
+                        input.dragging_particle_idx = Some(idx);
+                        input.pending_spawn = None;
+                    });
+                }
+            }
 
-                // Intersect ray with plane through camera target, facing camera
-                let plane_normal = (state.camera.eye() - state.camera.target).normalize();
-                if let Some(world_pos) = ray_plane_intersection(
-                    ray_origin,
-                    ray_dir,
-                    state.camera.target,
-                    plane_normal,
-                ) {
-                    state.spawn_particle(world_pos);
+            // Process pending delete (middle-click)
+            if let Some((dx, dy)) = pending_delete {
+                if let Some(idx) = state.pick_particle(dx, dy) {
+                    // If we're dragging this particle, stop
+                    if dragging_idx == Some(idx) {
+                        dragging_idx = None;
+                        INPUT_STATE.with(|input| {
+                            input.borrow_mut().dragging_particle_idx = None;
+                        });
+                    }
+                    state.delete_particle(idx);
+                }
+            }
+
+            if let Some(idx) = dragging_idx {
+                // Particle drag mode - don't move camera
+                if let Some((mx, my)) = current_mouse_pos {
+                    let (width, height) = state.size;
+                    let (ray_origin, ray_dir) = screen_to_world_ray(
+                        mx, my, width, height, &state.camera, &state.projection,
+                    );
+                    let plane_normal = (state.camera.eye() - state.camera.target).normalize();
+                    if let Some(world_pos) = ray_plane_intersection(
+                        ray_origin, ray_dir, state.camera.target, plane_normal,
+                    ) {
+                        state.drag_target = Some(world_pos);
+                        state.dragged_particle_idx = Some(idx);
+
+                        // If paused, directly update particle position
+                        if state.paused {
+                            state.update_particle_position_direct(idx, world_pos);
+                        }
+                    }
+                }
+            } else {
+                // Not particle dragging - update camera, hover, and handle spawns
+                state.drag_target = None;
+                state.dragged_particle_idx = None;
+
+                // Update camera from input
+                state.update_camera(rotate, zoom);
+
+                // Update hover detection
+                if let Some((mx, my)) = current_mouse_pos {
+                    state.hovered_particle_idx = state.pick_particle(mx, my);
+                } else {
+                    state.hovered_particle_idx = None;
+                }
+
+                // Handle click-to-spawn (only if we didn't click on a particle)
+                if !suppress_spawn {
+                    if let Some((screen_x, screen_y)) = pending_spawn {
+                        let (width, height) = state.size;
+                        let (ray_origin, ray_dir) = screen_to_world_ray(
+                            screen_x, screen_y, width, height,
+                            &state.camera, &state.projection,
+                        );
+                        let plane_normal =
+                            (state.camera.eye() - state.camera.target).normalize();
+                        if let Some(world_pos) = ray_plane_intersection(
+                            ray_origin, ray_dir, state.camera.target, plane_normal,
+                        ) {
+                            state.spawn_particle(world_pos);
+                        }
+                    }
                 }
             }
 
             match state.render() {
                 Ok(()) => {}
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                    // Reconfigure surface on lost/outdated
                     let (width, height) = state.size;
                     state.resize(width, height);
                 }
@@ -1707,4 +2077,78 @@ pub fn reset_camera() {
             state.camera.reset();
         }
     });
+}
+
+/// Sets the simulation pause state.
+/// When paused, particles freeze but camera can still orbit.
+#[wasm_bindgen]
+pub fn set_paused(paused: bool) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.paused = paused;
+        }
+    });
+}
+
+/// Returns the current pause state.
+#[wasm_bindgen]
+pub fn get_paused() -> bool {
+    STATE.with(|s| {
+        let state_ref = s.borrow();
+        state_ref.as_ref().map(|state| state.paused).unwrap_or(false)
+    })
+}
+
+/// Resets the simulation to its initial state.
+/// Preserves pause state and camera position.
+#[wasm_bindgen]
+pub fn reset_simulation() {
+    // Clear input drag state
+    INPUT_STATE.with(|input| {
+        let mut input = input.borrow_mut();
+        input.dragging_particle_idx = None;
+        input.pending_pick = None;
+        input.pending_delete = None;
+    });
+
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.reset_simulation();
+        }
+    });
+}
+
+/// Sets the gravitational constant.
+/// Value is clamped to [-2.0, 2.0].
+#[wasm_bindgen]
+pub fn set_gravity(value: f32) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.gravity = value.clamp(-2.0, 2.0);
+        }
+    });
+}
+
+/// Sets the simulation time scale.
+/// Value is clamped to [0.0, 3.0].
+#[wasm_bindgen]
+pub fn set_time_scale(value: f32) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.time_scale = value.clamp(0.0, 3.0);
+        }
+    });
+}
+
+/// Returns the current number of active particles.
+#[wasm_bindgen]
+pub fn get_particle_count() -> u32 {
+    STATE.with(|s| {
+        let state_ref = s.borrow();
+        state_ref.as_ref().map(|state| state.active_particle_count).unwrap_or(0)
+    })
 }
