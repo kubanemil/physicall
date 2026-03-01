@@ -101,5 +101,30 @@ pub(crate) fn create_initial_particles(count: u32, base_orbital_speed: f32) -> V
         });
     }
 
+    // Center the distribution: subtract center-of-mass position and velocity.
+    // The spiral distribution is not perfectly symmetric, leaving a small CoM
+    // offset (~0.064 units) and net momentum that would cause visible drift.
+    let n = count as f32;
+    let (mut cx, mut cy, mut cz) = (0.0f32, 0.0f32, 0.0f32);
+    let (mut cvx, mut cvy, mut cvz) = (0.0f32, 0.0f32, 0.0f32);
+    for p in &particles {
+        cx += p.position[0];
+        cy += p.position[1];
+        cz += p.position[2];
+        cvx += p.velocity[0];
+        cvy += p.velocity[1];
+        cvz += p.velocity[2];
+    }
+    cx /= n; cy /= n; cz /= n;
+    cvx /= n; cvy /= n; cvz /= n;
+    for p in &mut particles {
+        p.position[0] -= cx;
+        p.position[1] -= cy;
+        p.position[2] -= cz;
+        p.velocity[0] -= cvx;
+        p.velocity[1] -= cvy;
+        p.velocity[2] -= cvz;
+    }
+
     particles
 }
