@@ -8,6 +8,7 @@ import init, {
   reset_simulation_with_count,
   set_gravity,
   set_time_scale,
+  set_initial_speed,
   get_particle_count,
 } from '../../crates/physicall-core/pkg/physicall_core';
 
@@ -172,6 +173,15 @@ function setupUIControls(): void {
     const value = parseFloat(speedSlider.value);
     set_time_scale(value);
     speedValue.textContent = value.toFixed(1);
+  });
+
+  // Initial speed slider (takes effect on next reset)
+  const initialSpeedSlider = document.getElementById('initial-speed-slider') as HTMLInputElement;
+  const initialSpeedValue = document.getElementById('initial-speed-value') as HTMLSpanElement;
+  initialSpeedSlider.addEventListener('input', () => {
+    const value = parseFloat(initialSpeedSlider.value);
+    set_initial_speed(value);
+    initialSpeedValue.textContent = value.toFixed(1);
   });
 }
 

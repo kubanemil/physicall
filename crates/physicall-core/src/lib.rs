@@ -72,6 +72,21 @@ pub async fn init_webgpu(canvas_id: &str) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Returns the capped device pixel ratio (matching the JS cap of 2).
+fn capped_dpr() -> f32 {
+    let dpr = web_sys::window()
+        .map(|w| w.device_pixel_ratio())
+        .unwrap_or(1.0) as f32;
+    dpr.min(2.0)
+}
+
+/// Scales CSS-pixel mouse coordinates to physical-pixel coordinates.
+/// Mouse events report CSS pixels, but the canvas backing store uses physical pixels.
+fn scale_to_physical(coords: (f32, f32)) -> (f32, f32) {
+    let dpr = capped_dpr();
+    (coords.0 * dpr, coords.1 * dpr)
+}
+
 /// Renders a single frame.
 /// Called from JavaScript via requestAnimationFrame.
 #[wasm_bindgen]
@@ -95,7 +110,8 @@ pub fn render() -> Result<(), JsValue> {
             let mut suppress_spawn = false;
 
             // Process pending pick test (from mousedown)
-            if let Some((px, py)) = pending_pick {
+            if let Some(pick) = pending_pick.map(scale_to_physical) {
+                let (px, py) = pick;
                 if let Some(idx) = state.pick_particle(px, py) {
                     // Clicked on a particle - start dragging
                     dragging_idx = Some(idx);
@@ -109,7 +125,7 @@ pub fn render() -> Result<(), JsValue> {
             }
 
             // Process pending delete (middle-click)
-            if let Some((dx, dy)) = pending_delete {
+            if let Some((dx, dy)) = pending_delete.map(scale_to_physical) {
                 if let Some(idx) = state.pick_particle(dx, dy) {
                     // If we're dragging this particle, stop
                     if dragging_idx == Some(idx) {
@@ -124,7 +140,7 @@ pub fn render() -> Result<(), JsValue> {
 
             if let Some(idx) = dragging_idx {
                 // Particle drag mode - don't move camera
-                if let Some((mx, my)) = current_mouse_pos {
+                if let Some((mx, my)) = current_mouse_pos.map(scale_to_physical) {
                     let (width, height) = state.size;
                     let (ray_origin, ray_dir) = screen_to_world_ray(
                         mx, my, width, height, &state.camera, &state.projection,
@@ -151,7 +167,7 @@ pub fn render() -> Result<(), JsValue> {
                 state.update_camera(rotate, zoom);
 
                 // Update hover detection
-                if let Some((mx, my)) = current_mouse_pos {
+                if let Some((mx, my)) = current_mouse_pos.map(scale_to_physical) {
                     state.hovered_particle_idx = state.pick_particle(mx, my);
                 } else {
                     state.hovered_particle_idx = None;
@@ -159,7 +175,7 @@ pub fn render() -> Result<(), JsValue> {
 
                 // Handle click-to-spawn (only if we didn't click on a particle)
                 if !suppress_spawn {
-                    if let Some((screen_x, screen_y)) = pending_spawn {
+                    if let Some((screen_x, screen_y)) = pending_spawn.map(scale_to_physical) {
                         let (width, height) = state.size;
                         let (ray_origin, ray_dir) = screen_to_world_ray(
                             screen_x, screen_y, width, height,
@@ -299,6 +315,18 @@ pub fn set_time_scale(value: f32) {
         let mut state_ref = s.borrow_mut();
         if let Some(state) = state_ref.as_mut() {
             state.time_scale = value.clamp(0.0, 3.0);
+        }
+    });
+}
+
+/// Sets the initial orbital speed for particles.
+/// Takes effect on next reset. Value is clamped to [0.0, 2.0].
+#[wasm_bindgen]
+pub fn set_initial_speed(value: f32) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.initial_speed = value.clamp(0.0, 2.0);
         }
     });
 }

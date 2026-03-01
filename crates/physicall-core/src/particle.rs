@@ -60,19 +60,18 @@ pub(crate) const NUM_CELLS: u32 = 4096;
 pub(crate) const MAX_PER_CELL: u32 = 16;
 pub(crate) const CELL_SIZE: f32 = 2.0 * PARTICLE_SIZE;
 
+/// Default initial orbital speed for particles.
+pub(crate) const INITIAL_SPEED: f32 = 0.4;
+
 /// Creates initial particles in a ring distribution for N-body simulation.
 /// Particles are arranged in a disk in the XZ plane with tangential velocities
-/// to create orbital motion.
-pub(crate) fn create_initial_particles(count: u32) -> Vec<Particle> {
+/// to create orbital motion. `base_orbital_speed` controls the tangential velocity magnitude.
+pub(crate) fn create_initial_particles(count: u32, base_orbital_speed: f32) -> Vec<Particle> {
     let mut particles = Vec::with_capacity(count as usize);
 
     // Ring parameters
     let inner_radius = 0.8;
     let outer_radius = 2.0;
-
-    // Tangential velocity for roughly circular orbits
-    // v = sqrt(G * M_enclosed / r) approximated empirically
-    let base_orbital_speed = 0.4;
 
     for i in 0..count {
         let t = i as f32 / count as f32;

@@ -57,6 +57,7 @@ pub(crate) struct State {
     pub(crate) paused: bool,
     pub(crate) gravity: f32,
     pub(crate) time_scale: f32,
+    pub(crate) initial_speed: f32,
     initial_particles: Vec<Particle>,
     initial_particle_count: u32,
     // CPU-side particle positions for picking
@@ -388,7 +389,7 @@ impl State {
         // ====================================================================
 
         // Create initial particles (clone for reset capability)
-        let initial_particles = create_initial_particles(PARTICLE_COUNT);
+        let initial_particles = create_initial_particles(PARTICLE_COUNT, INITIAL_SPEED);
         let initial_particle_count = initial_particles.len() as u32;
         let active_particle_count = initial_particle_count;
 
@@ -743,6 +744,7 @@ impl State {
             paused: false,
             gravity: GRAVITATIONAL_CONSTANT,
             time_scale: 1.0,
+            initial_speed: INITIAL_SPEED,
             initial_particles: initial_particles.clone(),
             initial_particle_count,
             // CPU-side particle positions for picking
@@ -1090,7 +1092,7 @@ impl State {
     pub(crate) fn reset_simulation(&mut self, count: Option<u32>) {
         let particles = if let Some(c) = count {
             let c = c.min(self.max_particles);
-            let new_particles = create_initial_particles(c);
+            let new_particles = create_initial_particles(c, self.initial_speed);
             self.initial_particles = new_particles.clone();
             self.initial_particle_count = c;
             new_particles
