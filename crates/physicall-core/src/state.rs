@@ -68,6 +68,22 @@ pub(crate) struct State {
     pub(crate) drag_target: Option<Vec3>,
     // Point rendering bind group (includes camera + sim_params)
     point_bind_group: wgpu::BindGroup,
+    // Constraint system
+    #[allow(dead_code)]
+    constraint_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    particle_constraint_indices_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    particle_constraint_count_buffer: wgpu::Buffer,
+    constraint_solve_pipeline: wgpu::ComputePipeline,
+    constraint_particle_bind_groups: [wgpu::BindGroup; 2],
+    constraint_data_bind_group: wgpu::BindGroup,
+    // Simulation mode state
+    pub(crate) simulation_mode: u32,
+    pub(crate) stiffness: f32,
+    pub(crate) pressure: f32,
+    pub(crate) active_constraint_count: u32,
+    pub(crate) rest_area: f32,
 }
 
 impl State {
@@ -258,6 +274,13 @@ impl State {
             cell_size: CELL_SIZE,
             num_cells: NUM_CELLS,
             _padding: 0.0,
+            constraint_count: 0,
+            stiffness: DEFAULT_STIFFNESS,
+            pressure: DEFAULT_PRESSURE,
+            simulation_mode: 0,
+            gravity_y: DEFAULT_GRAVITY_Y,
+            rest_area: 0.0,
+            _padding2: [0.0; 2],
         };
         let sim_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Simulation Params Buffer"),
@@ -621,6 +644,176 @@ impl State {
         ];
 
         // ====================================================================
+        // Constraint Solver Pipeline Setup
+        // ====================================================================
+
+        // Create constraint GPU buffers
+        let constraint_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Constraint Buffer"),
+            size: (MAX_CONSTRAINTS as u64) * 16, // 16 bytes per Constraint
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let particle_constraint_indices_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Particle Constraint Indices Buffer"),
+            size: (MAX_PARTICLES as u64) * (MAX_CONSTRAINTS_PER_PARTICLE as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let particle_constraint_count_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Particle Constraint Count Buffer"),
+            size: (MAX_PARTICLES as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Constraint bind group layout - Group 0: particles (read_write) + sim_params (uniform)
+        let constraint_particle_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Constraint Particle Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Constraint bind group layout - Group 1: constraint data (read-only)
+        let constraint_data_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Constraint Data Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Create constraint particle bind groups (one per particle buffer)
+        let constraint_particle_bind_groups = [
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Constraint Particle Bind Group 0"),
+                layout: &constraint_particle_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[0].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }),
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Constraint Particle Bind Group 1"),
+                layout: &constraint_particle_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particle_buffers[1].as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: sim_params_buffer.as_entire_binding(),
+                    },
+                ],
+            }),
+        ];
+
+        // Create constraint data bind group (shared across both particle buffers)
+        let constraint_data_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Constraint Data Bind Group"),
+            layout: &constraint_data_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: constraint_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: particle_constraint_indices_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: particle_constraint_count_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Create constraint solver pipeline
+        let constraint_solve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Constraint Solve Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/constraint_solve.wgsl").into(),
+            ),
+        });
+
+        let constraint_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Constraint Pipeline Layout"),
+                bind_group_layouts: &[
+                    &constraint_particle_bind_group_layout,
+                    &constraint_data_bind_group_layout,
+                ],
+                ..Default::default()
+            });
+
+        let constraint_solve_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Constraint Solve Pipeline"),
+                layout: Some(&constraint_pipeline_layout),
+                module: &constraint_solve_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        // ====================================================================
         // Sphere Pipeline Setup (Instanced Icosphere)
         // ====================================================================
 
@@ -757,6 +950,19 @@ impl State {
             dragged_particle_idx: None,
             drag_target: None,
             point_bind_group,
+            // Constraint system
+            constraint_buffer,
+            particle_constraint_indices_buffer,
+            particle_constraint_count_buffer,
+            constraint_solve_pipeline,
+            constraint_particle_bind_groups,
+            constraint_data_bind_group,
+            // Simulation mode state
+            simulation_mode: 0,
+            stiffness: DEFAULT_STIFFNESS,
+            pressure: DEFAULT_PRESSURE,
+            active_constraint_count: 0,
+            rest_area: 0.0,
         }
     }
 
@@ -783,7 +989,7 @@ impl State {
             position: [world_pos.x, world_pos.y, world_pos.z],
             size: PARTICLE_SIZE,
             velocity: [0.0, 0.0, 0.0],
-            _padding: 0.0,
+            flags: 0,
         };
 
         // Write to both buffers at active_particle_count offset
@@ -881,7 +1087,7 @@ impl State {
             position: [pos.x, pos.y, pos.z],
             size: PARTICLE_SIZE,
             velocity: [0.0, 0.0, 0.0],
-            _padding: 0.0,
+            flags: 0,
         };
 
         let offset = (idx as usize) * std::mem::size_of::<Particle>();
@@ -938,6 +1144,13 @@ impl State {
             cell_size: CELL_SIZE,
             num_cells: NUM_CELLS,
             _padding: 0.0,
+            constraint_count: self.active_constraint_count,
+            stiffness: self.stiffness,
+            pressure: self.pressure,
+            simulation_mode: self.simulation_mode,
+            gravity_y: DEFAULT_GRAVITY_Y,
+            rest_area: self.rest_area,
+            _padding2: [0.0; 2],
         };
         self.queue.write_buffer(
             &self.sim_params_buffer,
@@ -1006,6 +1219,25 @@ impl State {
                 pass.set_pipeline(&self.compute_pipeline);
                 pass.set_bind_group(0, &self.compute_bind_groups[read_idx], &[]);
                 pass.set_bind_group(1, &self.hash_bind_group, &[]);
+                pass.dispatch_workgroups(particle_workgroups, 1, 1);
+            }
+        }
+
+        // Constraint solver passes (after physics, before render)
+        if !self.paused && self.active_constraint_count > 0 {
+            let particle_workgroups = (self.active_particle_count + 255) / 256;
+            for _iteration in 0..SOLVER_ITERATIONS {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Constraint Solve Pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.constraint_solve_pipeline);
+                pass.set_bind_group(
+                    0,
+                    &self.constraint_particle_bind_groups[write_idx],
+                    &[],
+                );
+                pass.set_bind_group(1, &self.constraint_data_bind_group, &[]);
                 pass.dispatch_workgroups(particle_workgroups, 1, 1);
             }
         }
@@ -1089,42 +1321,124 @@ impl State {
     }
 
     /// Resets the simulation, optionally with a new particle count.
+    /// Respects current simulation_mode: for N-body uses ring distribution,
+    /// for constraint modes reinitializes the preset.
     pub(crate) fn reset_simulation(&mut self, count: Option<u32>) {
-        let particles = if let Some(c) = count {
-            let c = c.min(self.max_particles);
-            let new_particles = create_initial_particles(c, self.initial_speed);
-            self.initial_particles = new_particles.clone();
-            self.initial_particle_count = c;
-            new_particles
-        } else {
-            self.initial_particles.clone()
-        };
+        if self.simulation_mode == 0 {
+            // N-body mode
+            let particles = if let Some(c) = count {
+                let c = c.min(self.max_particles);
+                let new_particles = create_initial_particles(c, self.initial_speed);
+                self.initial_particles = new_particles.clone();
+                self.initial_particle_count = c;
+                new_particles
+            } else {
+                self.initial_particles.clone()
+            };
 
-        // Write particles to both buffers
+            self.upload_particles(&particles);
+            self.active_particle_count = particles.len() as u32;
+            self.active_constraint_count = 0;
+        } else {
+            // Constraint modes: reinitialize the preset
+            self.set_simulation_mode(self.simulation_mode);
+            return;
+        }
+
+        self.frame_index = 0;
+        self.hovered_particle_idx = None;
+        self.dragged_particle_idx = None;
+        self.drag_target = None;
+    }
+
+    /// Switches the simulation mode and reinitializes particles and constraints.
+    pub(crate) fn set_simulation_mode(&mut self, mode: u32) {
+        self.simulation_mode = mode;
+
+        match mode {
+            0 => {
+                // N-body: use ring distribution
+                let particles = create_initial_particles(
+                    self.initial_particle_count,
+                    self.initial_speed,
+                );
+                self.initial_particles = particles.clone();
+                self.upload_particles(&particles);
+                self.active_particle_count = particles.len() as u32;
+                self.active_constraint_count = 0;
+                self.rest_area = 0.0;
+                // Clear constraint buffers
+                self.queue.write_buffer(
+                    &self.particle_constraint_count_buffer,
+                    0,
+                    bytemuck::cast_slice(&vec![0u32; particles.len()]),
+                );
+            }
+            1 => {
+                // Cloth: 30x30 grid
+                let data = create_cloth_particles(30, 30, 0.08);
+                self.upload_preset_data(&data);
+            }
+            2 => {
+                // Rope: 50 particles
+                let data = create_rope_particles(50, 0.06);
+                self.upload_preset_data(&data);
+            }
+            _ => {
+                // Unknown mode — fall back to N-body
+                self.set_simulation_mode(0);
+                return;
+            }
+        }
+
+        self.frame_index = 0;
+        self.hovered_particle_idx = None;
+        self.dragged_particle_idx = None;
+        self.drag_target = None;
+    }
+
+    /// Uploads particles to both GPU buffers and updates CPU positions.
+    fn upload_particles(&mut self, particles: &[Particle]) {
         self.queue.write_buffer(
             &self.particle_buffers[0],
             0,
-            bytemuck::cast_slice(&particles),
+            bytemuck::cast_slice(particles),
         );
         self.queue.write_buffer(
             &self.particle_buffers[1],
             0,
-            bytemuck::cast_slice(&particles),
+            bytemuck::cast_slice(particles),
         );
-
-        // Reset particle count and frame index
-        self.active_particle_count = self.initial_particle_count;
-        self.frame_index = 0;
-
-        // Reset CPU positions
         self.particle_positions = particles
             .iter()
             .map(|p| Vec3::new(p.position[0], p.position[1], p.position[2]))
             .collect();
+    }
 
-        // Clear interaction state
-        self.hovered_particle_idx = None;
-        self.dragged_particle_idx = None;
-        self.drag_target = None;
+    /// Uploads a full preset (particles + constraints) to GPU buffers.
+    fn upload_preset_data(&mut self, data: &PresetData) {
+        self.upload_particles(&data.particles);
+        self.active_particle_count = data.particles.len() as u32;
+        self.active_constraint_count = data.constraints.len() as u32;
+        self.rest_area = 0.0;
+
+        // Upload constraints
+        self.queue.write_buffer(
+            &self.constraint_buffer,
+            0,
+            bytemuck::cast_slice(&data.constraints),
+        );
+        // Upload per-particle constraint indices
+        self.queue.write_buffer(
+            &self.particle_constraint_indices_buffer,
+            0,
+            bytemuck::cast_slice(&data.constraint_indices),
+        );
+        // Upload per-particle constraint counts
+        self.queue.write_buffer(
+            &self.particle_constraint_count_buffer,
+            0,
+            bytemuck::cast_slice(&data.constraint_counts),
+        );
     }
 }

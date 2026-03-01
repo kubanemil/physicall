@@ -6,7 +6,7 @@ struct Particle {
     position: vec3f,
     size: f32,
     velocity: vec3f,
-    _padding: f32,
+    flags: u32,
 }
 
 struct SimParams {
@@ -24,6 +24,15 @@ struct SimParams {
     cell_size: f32,               // Spatial hash cell size
     num_cells: u32,               // Spatial hash table size
     _padding: f32,
+    // Constraint fields
+    constraint_count: u32,
+    stiffness: f32,
+    pressure: f32,
+    simulation_mode: u32,         // 0=NBody, 1=Cloth, 2=Rope, 3=SoftBody
+    gravity_y: f32,
+    rest_area: f32,
+    _padding2a: f32,
+    _padding2b: f32,
 }
 
 @group(0) @binding(0) var<storage, read> particles_in: array<Particle>;
@@ -46,45 +55,50 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var collision_velocity_delta = vec3f(0.0, 0.0, 0.0);
     var collision_position_delta = vec3f(0.0, 0.0, 0.0);
 
-    // N-body gravitational force + collision detection (O(n²))
-    // Collision is checked in the same loop to guarantee symmetric pair detection,
-    // which preserves momentum conservation (spatial hash can miss pairs on overflow).
-    for (var i = 0u; i < params.particle_count; i++) {
-        if (i == idx) {
-            continue;
-        }
+    if (params.simulation_mode == 0u) {
+        // N-body gravitational force + collision detection (O(n²))
+        // Collision is checked in the same loop to guarantee symmetric pair detection,
+        // which preserves momentum conservation (spatial hash can miss pairs on overflow).
+        for (var i = 0u; i < params.particle_count; i++) {
+            if (i == idx) {
+                continue;
+            }
 
-        let other = particles_in[i];
-        let diff = other.position - particle.position;
-        let actual_dist_sq = dot(diff, diff);
-        let dist_sq = actual_dist_sq + params.softening_sq;
-        let dist = sqrt(dist_sq);
+            let other = particles_in[i];
+            let diff = other.position - particle.position;
+            let actual_dist_sq = dot(diff, diff);
+            let dist_sq = actual_dist_sq + params.softening_sq;
+            let dist = sqrt(dist_sq);
 
-        // Gravitational acceleration: G / r² (with softening)
-        let force_mag = params.gravitational_constant / dist_sq;
-        acceleration += (diff / dist) * force_mag;
+            // Gravitational acceleration: G / r² (with softening)
+            let force_mag = params.gravitational_constant / dist_sq;
+            acceleration += (diff / dist) * force_mag;
 
-        // Collision detection (no hash needed — same O(n²) loop)
-        let actual_dist = sqrt(actual_dist_sq);
-        let combined_radius = particle.size + other.size;
+            // Collision detection (no hash needed — same O(n²) loop)
+            let actual_dist = sqrt(actual_dist_sq);
+            let combined_radius = particle.size + other.size;
 
-        if (actual_dist < combined_radius && actual_dist > 0.0001) {
-            let normal = diff / actual_dist;
+            if (actual_dist < combined_radius && actual_dist > 0.0001) {
+                let normal = diff / actual_dist;
 
-            // Position correction: push away by half the overlap
-            let overlap = combined_radius - actual_dist;
-            collision_position_delta -= normal * (overlap * 0.5);
+                // Position correction: push away by half the overlap
+                let overlap = combined_radius - actual_dist;
+                collision_position_delta -= normal * (overlap * 0.5);
 
-            // Relative velocity along collision normal
-            let rel_vel = particle.velocity - other.velocity;
-            let v_n = dot(rel_vel, normal);
+                // Relative velocity along collision normal
+                let rel_vel = particle.velocity - other.velocity;
+                let v_n = dot(rel_vel, normal);
 
-            // Only apply impulse if particles are approaching
-            if (v_n > 0.0) {
-                let impulse = -(1.0 + params.restitution) * v_n * 0.5;
-                collision_velocity_delta += normal * impulse;
+                // Only apply impulse if particles are approaching
+                if (v_n > 0.0) {
+                    let impulse = -(1.0 + params.restitution) * v_n * 0.5;
+                    collision_velocity_delta += normal * impulse;
+                }
             }
         }
+    } else {
+        // Constraint modes (Cloth, Rope, SoftBody): simple downward gravity only
+        acceleration = vec3f(0.0, params.gravity_y, 0.0);
     }
 
     // Apply drag force if this particle is being dragged
@@ -95,12 +109,28 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         particle.velocity *= 0.8;
     }
 
+    // Skip position update for pinned particles (bit 0 of flags)
+    if ((particle.flags & 1u) != 0u) {
+        particles_out[idx] = particle;
+        return;
+    }
+
     // Apply collision velocity delta before integration
     particle.velocity += collision_velocity_delta;
 
     // Semi-implicit Euler integration
     particle.velocity += acceleration * params.delta_time;
-    particle.velocity *= params.damping;
+
+    // Apply mode-appropriate damping:
+    // N-body uses params.damping (1.0 = no damping, preserves orbital energy)
+    // Constraint modes need damping to prevent velocity diverging from
+    // constraint-corrected positions (PBD corrects position, not velocity)
+    if (params.simulation_mode == 0u) {
+        particle.velocity *= params.damping;
+    } else {
+        particle.velocity *= 0.98;
+    }
+
     particle.position += particle.velocity * params.delta_time;
 
     // Apply collision position correction after integration

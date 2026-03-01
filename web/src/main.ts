@@ -10,6 +10,8 @@ import init, {
   set_time_scale,
   set_initial_speed,
   get_particle_count,
+  set_simulation_mode,
+  set_stiffness,
 } from '../../crates/physicall-core/pkg/physicall_core';
 
 interface WebGPUCheckResult {
@@ -138,6 +140,28 @@ function setupUIControls(): void {
   const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
   const speedValue = document.getElementById('speed-value') as HTMLSpanElement;
   const pausedOverlay = document.getElementById('paused-overlay') as HTMLDivElement;
+  const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
+  const stiffnessGroup = document.getElementById('stiffness-group') as HTMLDivElement;
+  const stiffnessSlider = document.getElementById('stiffness-slider') as HTMLInputElement;
+  const stiffnessValue = document.getElementById('stiffness-value') as HTMLSpanElement;
+  const initialSpeedGroup = document.getElementById('initial-speed-group') as HTMLDivElement;
+
+  // Updates visibility of mode-specific controls
+  function updateModeControls(mode: number): void {
+    const isNBody = mode === 0;
+    // Show/hide N-body specific controls
+    initialSpeedGroup.classList.toggle('hidden', !isNBody);
+    particleCountInput.classList.toggle('hidden', !isNBody);
+    // Show/hide constraint-specific controls
+    stiffnessGroup.classList.toggle('hidden', isNBody);
+  }
+
+  // Preset selector
+  presetSelect.addEventListener('change', () => {
+    const mode = parseInt(presetSelect.value, 10);
+    set_simulation_mode(mode);
+    updateModeControls(mode);
+  });
 
   // Pause/Resume button
   pauseBtn.addEventListener('click', () => {
@@ -151,11 +175,16 @@ function setupUIControls(): void {
     }
   });
 
-  // Reset button — uses particle count from input
+  // Reset button — uses particle count from input (N-body mode only)
   resetBtn.addEventListener('click', () => {
-    const count = parseInt(particleCountInput.value, 10);
-    if (count > 0) {
-      reset_simulation_with_count(count);
+    const mode = parseInt(presetSelect.value, 10);
+    if (mode === 0) {
+      const count = parseInt(particleCountInput.value, 10);
+      if (count > 0) {
+        reset_simulation_with_count(count);
+      } else {
+        reset_simulation();
+      }
     } else {
       reset_simulation();
     }
@@ -175,13 +204,20 @@ function setupUIControls(): void {
     speedValue.textContent = value.toFixed(1);
   });
 
-  // Initial speed slider (takes effect on next reset)
+  // Initial speed slider (takes effect on next reset, N-body only)
   const initialSpeedSlider = document.getElementById('initial-speed-slider') as HTMLInputElement;
-  const initialSpeedValue = document.getElementById('initial-speed-value') as HTMLSpanElement;
+  const initialSpeedValueEl = document.getElementById('initial-speed-value') as HTMLSpanElement;
   initialSpeedSlider.addEventListener('input', () => {
     const value = parseFloat(initialSpeedSlider.value);
     set_initial_speed(value);
-    initialSpeedValue.textContent = value.toFixed(1);
+    initialSpeedValueEl.textContent = value.toFixed(1);
+  });
+
+  // Stiffness slider (constraint modes only)
+  stiffnessSlider.addEventListener('input', () => {
+    const value = parseFloat(stiffnessSlider.value);
+    set_stiffness(value);
+    stiffnessValue.textContent = value.toFixed(2);
   });
 }
 

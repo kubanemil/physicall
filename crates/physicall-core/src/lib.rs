@@ -339,3 +339,43 @@ pub fn get_particle_count() -> u32 {
         state_ref.as_ref().map(|state| state.active_particle_count).unwrap_or(0)
     })
 }
+
+/// Sets the simulation mode and reinitializes particles/constraints.
+/// 0=NBody, 1=Cloth, 2=Rope, 3=SoftBody
+#[wasm_bindgen]
+pub fn set_simulation_mode(mode: u32) {
+    INPUT_STATE.with(|input| {
+        let mut input = input.borrow_mut();
+        input.dragging_particle_idx = None;
+        input.pending_pick = None;
+        input.pending_delete = None;
+    });
+
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.set_simulation_mode(mode);
+        }
+    });
+}
+
+/// Returns the current simulation mode.
+#[wasm_bindgen]
+pub fn get_simulation_mode() -> u32 {
+    STATE.with(|s| {
+        let state_ref = s.borrow();
+        state_ref.as_ref().map(|state| state.simulation_mode).unwrap_or(0)
+    })
+}
+
+/// Sets the constraint stiffness.
+/// Value is clamped to [0.0, 1.0].
+#[wasm_bindgen]
+pub fn set_stiffness(value: f32) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.stiffness = value.clamp(0.0, 1.0);
+        }
+    });
+}

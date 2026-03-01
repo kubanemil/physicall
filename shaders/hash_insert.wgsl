@@ -5,7 +5,7 @@ struct Particle {
     position: vec3f,
     size: f32,
     velocity: vec3f,
-    _padding: f32,
+    flags: u32,
 }
 
 struct SimParams {
@@ -23,6 +23,15 @@ struct SimParams {
     cell_size: f32,
     num_cells: u32,
     _padding: f32,
+    // Constraint fields
+    constraint_count: u32,
+    stiffness: f32,
+    pressure: f32,
+    simulation_mode: u32,
+    gravity_y: f32,
+    rest_area: f32,
+    _padding2a: f32,
+    _padding2b: f32,
 }
 
 const MAX_PER_CELL: u32 = 16u;

@@ -22,6 +22,15 @@ struct SimParams {
     cell_size: f32,
     num_cells: u32,
     _padding: f32,
+    // Constraint fields
+    constraint_count: u32,
+    stiffness: f32,
+    pressure: f32,
+    simulation_mode: u32,
+    gravity_y: f32,
+    rest_area: f32,
+    _padding2a: f32,
+    _padding2b: f32,
 }
 
 @group(0) @binding(0)

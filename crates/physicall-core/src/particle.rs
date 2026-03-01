@@ -6,8 +6,32 @@ pub(crate) struct Particle {
     pub(crate) position: [f32; 3],
     pub(crate) size: f32,
     pub(crate) velocity: [f32; 3],
-    pub(crate) _padding: f32,  // Align to 32 bytes
+    pub(crate) flags: u32, // Bit 0 = is_pinned. Align to 32 bytes.
 }
+
+/// Distance constraint between two particles.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct Constraint {
+    pub(crate) index_a: u32,
+    pub(crate) index_b: u32,
+    pub(crate) rest_length: f32,
+    pub(crate) _padding: u32,
+}
+
+/// Maximum number of constraints in the simulation.
+pub(crate) const MAX_CONSTRAINTS: u32 = 8192;
+/// Maximum number of constraints per particle (fixed-bucket lookup).
+pub(crate) const MAX_CONSTRAINTS_PER_PARTICLE: u32 = 12;
+/// Number of constraint solver iterations per frame.
+pub(crate) const SOLVER_ITERATIONS: u32 = 4;
+/// Default constraint stiffness (0.0 = no correction, 1.0 = full correction).
+pub(crate) const DEFAULT_STIFFNESS: f32 = 1.0;
+/// Default pressure coefficient for soft bodies.
+pub(crate) const DEFAULT_PRESSURE: f32 = 1.0;
+/// Default downward gravity for constraint modes.
+/// Tuned for simulation scale (~2.4 unit cloth). Real-world 9.8 is too strong.
+pub(crate) const DEFAULT_GRAVITY_Y: f32 = -3.0;
 
 impl Particle {
     const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
@@ -26,7 +50,8 @@ impl Particle {
 }
 
 /// Simulation parameters uniform buffer.
-/// Layout must match SimParams in particle_compute.wgsl and point.wgsl.
+/// Layout must match SimParams in particle_compute.wgsl, point.wgsl,
+/// hash_insert.wgsl, and constraint_solve.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SimParams {
@@ -44,6 +69,14 @@ pub(crate) struct SimParams {
     pub(crate) cell_size: f32,
     pub(crate) num_cells: u32,
     pub(crate) _padding: f32,
+    // Constraint fields (Phase 1)
+    pub(crate) constraint_count: u32,
+    pub(crate) stiffness: f32,
+    pub(crate) pressure: f32,
+    pub(crate) simulation_mode: u32, // 0=NBody, 1=Cloth, 2=Rope, 3=SoftBody
+    pub(crate) gravity_y: f32,
+    pub(crate) rest_area: f32,
+    pub(crate) _padding2: [f32; 2], // Pad to 96 bytes total, 16-byte aligned
 }
 
 /// Physics simulation constants for N-body simulation
@@ -97,7 +130,7 @@ pub(crate) fn create_initial_particles(count: u32, base_orbital_speed: f32) -> V
             position: [x, y, z],
             size: PARTICLE_SIZE,
             velocity: [vx, vy, vz],
-            _padding: 0.0,
+            flags: 0,
         });
     }
 
@@ -127,4 +160,163 @@ pub(crate) fn create_initial_particles(count: u32, base_orbital_speed: f32) -> V
     }
 
     particles
+}
+
+/// Result type for preset initialization functions.
+/// Contains particles, constraints, and per-particle constraint index lists.
+pub(crate) struct PresetData {
+    pub(crate) particles: Vec<Particle>,
+    pub(crate) constraints: Vec<Constraint>,
+    /// Per-particle constraint indices, flattened. Length = particle_count * MAX_CONSTRAINTS_PER_PARTICLE.
+    pub(crate) constraint_indices: Vec<u32>,
+    /// Per-particle constraint count. Length = particle_count.
+    pub(crate) constraint_counts: Vec<u32>,
+}
+
+/// Creates a cloth grid in the XY plane for cloth simulation.
+/// Top-left and top-right corners are pinned.
+pub(crate) fn create_cloth_particles(cols: u32, rows: u32, spacing: f32) -> PresetData {
+    let count = cols * rows;
+    let mut particles = Vec::with_capacity(count as usize);
+    let mut constraints = Vec::new();
+    // Per-particle constraint index lists
+    let mut per_particle: Vec<Vec<u32>> = vec![Vec::new(); count as usize];
+
+    let half_w = (cols - 1) as f32 * spacing * 0.5;
+    let top_y = (rows - 1) as f32 * spacing * 0.5;
+
+    // Create particles in a grid (row-major: row 0 is top)
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = col as f32 * spacing - half_w;
+            let y = top_y - row as f32 * spacing;
+            let z = 0.0;
+
+            // Pin top-left and top-right corners
+            let is_pinned = row == 0 && (col == 0 || col == cols - 1);
+
+            particles.push(Particle {
+                position: [x, y, z],
+                size: PARTICLE_SIZE,
+                velocity: [0.0; 3],
+                flags: if is_pinned { 1 } else { 0 },
+            });
+        }
+    }
+
+    // Helper to add a constraint between two particle indices
+    let mut add_constraint = |a: u32, b: u32, rest_len: f32| {
+        let idx = constraints.len() as u32;
+        constraints.push(Constraint {
+            index_a: a,
+            index_b: b,
+            rest_length: rest_len,
+            _padding: 0,
+        });
+        per_particle[a as usize].push(idx);
+        per_particle[b as usize].push(idx);
+    };
+
+    // Structural constraints: horizontal + vertical neighbors
+    for row in 0..rows {
+        for col in 0..cols {
+            let i = row * cols + col;
+            // Right neighbor
+            if col + 1 < cols {
+                add_constraint(i, i + 1, spacing);
+            }
+            // Bottom neighbor
+            if row + 1 < rows {
+                add_constraint(i, i + cols, spacing);
+            }
+        }
+    }
+
+    // Shear constraints: diagonal neighbors
+    let diag = spacing * std::f32::consts::SQRT_2;
+    for row in 0..rows {
+        for col in 0..cols {
+            let i = row * cols + col;
+            // Bottom-right diagonal
+            if col + 1 < cols && row + 1 < rows {
+                add_constraint(i, i + cols + 1, diag);
+            }
+            // Bottom-left diagonal
+            if col > 0 && row + 1 < rows {
+                add_constraint(i, i + cols - 1, diag);
+            }
+        }
+    }
+
+    // Flatten per-particle indices into fixed-bucket arrays
+    let (constraint_indices, constraint_counts) = flatten_constraint_indices(&per_particle);
+
+    PresetData {
+        particles,
+        constraints,
+        constraint_indices,
+        constraint_counts,
+    }
+}
+
+/// Creates a rope (chain) of particles along the X axis.
+/// First particle is pinned.
+pub(crate) fn create_rope_particles(count: u32, spacing: f32) -> PresetData {
+    let mut particles = Vec::with_capacity(count as usize);
+    let mut constraints = Vec::new();
+    let mut per_particle: Vec<Vec<u32>> = vec![Vec::new(); count as usize];
+
+    let half_len = (count - 1) as f32 * spacing * 0.5;
+
+    for i in 0..count {
+        let x = i as f32 * spacing - half_len;
+        let is_pinned = i == 0;
+
+        particles.push(Particle {
+            position: [x, 1.0, 0.0], // Start elevated so it can swing
+            size: PARTICLE_SIZE,
+            velocity: [0.0; 3],
+            flags: if is_pinned { 1 } else { 0 },
+        });
+    }
+
+    // Chain constraints between consecutive particles
+    for i in 0..(count - 1) {
+        let idx = constraints.len() as u32;
+        constraints.push(Constraint {
+            index_a: i,
+            index_b: i + 1,
+            rest_length: spacing,
+            _padding: 0,
+        });
+        per_particle[i as usize].push(idx);
+        per_particle[(i + 1) as usize].push(idx);
+    }
+
+    let (constraint_indices, constraint_counts) = flatten_constraint_indices(&per_particle);
+
+    PresetData {
+        particles,
+        constraints,
+        constraint_indices,
+        constraint_counts,
+    }
+}
+
+/// Flattens per-particle constraint index lists into fixed-bucket arrays
+/// for GPU upload.
+fn flatten_constraint_indices(per_particle: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
+    let count = per_particle.len();
+    let mut indices = vec![0u32; count * MAX_CONSTRAINTS_PER_PARTICLE as usize];
+    let mut counts = vec![0u32; count];
+
+    for (i, particle_constraints) in per_particle.iter().enumerate() {
+        let n = particle_constraints.len().min(MAX_CONSTRAINTS_PER_PARTICLE as usize);
+        counts[i] = n as u32;
+        for (j, &ci) in particle_constraints.iter().take(n).enumerate() {
+            indices[i * MAX_CONSTRAINTS_PER_PARTICLE as usize + j] = ci;
+        }
+    }
+
+    (indices, counts)
 }
