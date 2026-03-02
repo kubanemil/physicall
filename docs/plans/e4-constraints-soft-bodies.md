@@ -1,7 +1,7 @@
 ---
 date: 2026-03-01
 author: claude-opus-4-6
-status: draft
+status: complete
 branch: main
 related_research: docs/prfaq/e4-constraints-soft-bodies.md
 ---
