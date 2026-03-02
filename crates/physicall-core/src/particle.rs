@@ -171,6 +171,8 @@ pub(crate) struct PresetData {
     pub(crate) constraint_indices: Vec<u32>,
     /// Per-particle constraint count. Length = particle_count.
     pub(crate) constraint_counts: Vec<u32>,
+    /// Rest area for pressure-based soft bodies (0.0 for non-pressure presets).
+    pub(crate) rest_area: f32,
 }
 
 /// Creates a cloth grid in the XY plane for cloth simulation.
@@ -256,6 +258,7 @@ pub(crate) fn create_cloth_particles(cols: u32, rows: u32, spacing: f32) -> Pres
         constraints,
         constraint_indices,
         constraint_counts,
+        rest_area: 0.0,
     }
 }
 
@@ -300,6 +303,73 @@ pub(crate) fn create_rope_particles(count: u32, spacing: f32) -> PresetData {
         constraints,
         constraint_indices,
         constraint_counts,
+        rest_area: 0.0,
+    }
+}
+
+/// Creates a soft body ring of particles in the XY plane.
+/// Particles are arranged in a circle with perimeter constraints and cross-bracing.
+/// Returns PresetData with computed rest_area via shoelace formula.
+pub(crate) fn create_soft_body_particles(num_ring: u32, radius: f32) -> PresetData {
+    let mut particles = Vec::with_capacity(num_ring as usize);
+    let mut constraints = Vec::new();
+    let mut per_particle: Vec<Vec<u32>> = vec![Vec::new(); num_ring as usize];
+
+    // Create ring of particles in XY plane, elevated so it can fall
+    let start_y = 1.5;
+    for i in 0..num_ring {
+        let angle = (i as f32 / num_ring as f32) * std::f32::consts::PI * 2.0;
+        let x = radius * angle.cos();
+        let y = start_y + radius * angle.sin();
+
+        particles.push(Particle {
+            position: [x, y, 0.0],
+            size: PARTICLE_SIZE,
+            velocity: [0.0; 3],
+            flags: 0,
+        });
+    }
+
+    // Perimeter constraints only: each particle connected to next (wrapping).
+    // No cross-bracing! The ring shape is maintained by internal pressure,
+    // not by rigid diameter constraints. This allows the ring to deform freely
+    // on impact, which triggers a strong pressure response (the bounce).
+    let perimeter_spacing = 2.0 * std::f32::consts::PI * radius / num_ring as f32;
+    let mut add_constraint = |a: u32, b: u32, rest_len: f32| {
+        let idx = constraints.len() as u32;
+        constraints.push(Constraint {
+            index_a: a,
+            index_b: b,
+            rest_length: rest_len,
+            _padding: 0,
+        });
+        per_particle[a as usize].push(idx);
+        per_particle[b as usize].push(idx);
+    };
+
+    for i in 0..num_ring {
+        let next = (i + 1) % num_ring;
+        add_constraint(i, next, perimeter_spacing);
+    }
+
+    // Compute rest area via shoelace formula
+    let mut area = 0.0f32;
+    for i in 0..num_ring {
+        let j = (i + 1) % num_ring;
+        let pi = &particles[i as usize];
+        let pj = &particles[j as usize];
+        area += pi.position[0] * pj.position[1] - pj.position[0] * pi.position[1];
+    }
+    let rest_area = area.abs() * 0.5;
+
+    let (constraint_indices, constraint_counts) = flatten_constraint_indices(&per_particle);
+
+    PresetData {
+        particles,
+        constraints,
+        constraint_indices,
+        constraint_counts,
+        rest_area,
     }
 }
 

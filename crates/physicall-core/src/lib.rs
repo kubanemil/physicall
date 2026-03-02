@@ -379,3 +379,15 @@ pub fn set_stiffness(value: f32) {
         }
     });
 }
+
+/// Sets the pressure coefficient for soft body simulation.
+/// Value is clamped to [0.0, 5.0].
+#[wasm_bindgen]
+pub fn set_pressure(value: f32) {
+    STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        if let Some(state) = state_ref.as_mut() {
+            state.pressure = value.clamp(0.0, 5.0);
+        }
+    });
+}

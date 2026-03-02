@@ -76,6 +76,7 @@ pub(crate) struct State {
     #[allow(dead_code)]
     particle_constraint_count_buffer: wgpu::Buffer,
     constraint_solve_pipeline: wgpu::ComputePipeline,
+    pressure_pipeline: wgpu::ComputePipeline,
     constraint_particle_bind_groups: [wgpu::BindGroup; 2],
     constraint_data_bind_group: wgpu::BindGroup,
     // Simulation mode state
@@ -813,6 +814,31 @@ impl State {
                 cache: None,
             });
 
+        // Pressure pipeline (reuses constraint_particle_bind_group_layout, single group)
+        let pressure_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Pressure Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/pressure.wgsl").into(),
+            ),
+        });
+
+        let pressure_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Pressure Pipeline Layout"),
+                bind_group_layouts: &[&constraint_particle_bind_group_layout],
+                ..Default::default()
+            });
+
+        let pressure_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Pressure Pipeline"),
+                layout: Some(&pressure_pipeline_layout),
+                module: &pressure_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
         // ====================================================================
         // Sphere Pipeline Setup (Instanced Icosphere)
         // ====================================================================
@@ -955,6 +981,7 @@ impl State {
             particle_constraint_indices_buffer,
             particle_constraint_count_buffer,
             constraint_solve_pipeline,
+            pressure_pipeline,
             constraint_particle_bind_groups,
             constraint_data_bind_group,
             // Simulation mode state
@@ -1241,6 +1268,22 @@ impl State {
                 pass.dispatch_workgroups(particle_workgroups, 1, 1);
             }
         }
+
+        // Pressure pass (after constraint solver, soft body only)
+        if !self.paused && self.simulation_mode == 3 {
+            let particle_workgroups = (self.active_particle_count + 255) / 256;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Pressure Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pressure_pipeline);
+            pass.set_bind_group(
+                0,
+                &self.constraint_particle_bind_groups[write_idx],
+                &[],
+            );
+            pass.dispatch_workgroups(particle_workgroups, 1, 1);
+        }
         // Implicit memory barrier here - wgpu ensures compute writes complete before render reads
 
         // Render pass
@@ -1384,6 +1427,11 @@ impl State {
                 let data = create_rope_particles(50, 0.06);
                 self.upload_preset_data(&data);
             }
+            3 => {
+                // Soft body: ring of 40 particles
+                let data = create_soft_body_particles(40, 0.8);
+                self.upload_preset_data(&data);
+            }
             _ => {
                 // Unknown mode — fall back to N-body
                 self.set_simulation_mode(0);
@@ -1420,7 +1468,7 @@ impl State {
         self.upload_particles(&data.particles);
         self.active_particle_count = data.particles.len() as u32;
         self.active_constraint_count = data.constraints.len() as u32;
-        self.rest_area = 0.0;
+        self.rest_area = data.rest_area;
 
         // Upload constraints
         self.queue.write_buffer(

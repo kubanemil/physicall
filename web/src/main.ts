@@ -12,6 +12,7 @@ import init, {
   get_particle_count,
   set_simulation_mode,
   set_stiffness,
+  set_pressure,
 } from '../../crates/physicall-core/pkg/physicall_core';
 
 interface WebGPUCheckResult {
@@ -144,16 +145,22 @@ function setupUIControls(): void {
   const stiffnessGroup = document.getElementById('stiffness-group') as HTMLDivElement;
   const stiffnessSlider = document.getElementById('stiffness-slider') as HTMLInputElement;
   const stiffnessValue = document.getElementById('stiffness-value') as HTMLSpanElement;
+  const pressureGroup = document.getElementById('pressure-group') as HTMLDivElement;
+  const pressureSlider = document.getElementById('pressure-slider') as HTMLInputElement;
+  const pressureValue = document.getElementById('pressure-value') as HTMLSpanElement;
   const initialSpeedGroup = document.getElementById('initial-speed-group') as HTMLDivElement;
 
   // Updates visibility of mode-specific controls
   function updateModeControls(mode: number): void {
     const isNBody = mode === 0;
+    const isSoftBody = mode === 3;
     // Show/hide N-body specific controls
     initialSpeedGroup.classList.toggle('hidden', !isNBody);
     particleCountInput.classList.toggle('hidden', !isNBody);
     // Show/hide constraint-specific controls
     stiffnessGroup.classList.toggle('hidden', isNBody);
+    // Pressure slider only for soft body
+    pressureGroup.classList.toggle('hidden', !isSoftBody);
   }
 
   // Preset selector
@@ -218,6 +225,13 @@ function setupUIControls(): void {
     const value = parseFloat(stiffnessSlider.value);
     set_stiffness(value);
     stiffnessValue.textContent = value.toFixed(2);
+  });
+
+  // Pressure slider (soft body only)
+  pressureSlider.addEventListener('input', () => {
+    const value = parseFloat(pressureSlider.value);
+    set_pressure(value);
+    pressureValue.textContent = value.toFixed(1);
   });
 }
 

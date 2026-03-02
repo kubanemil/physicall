@@ -319,8 +319,8 @@ Add "Soft Body" as fourth option in preset selector dropdown.
 ### Success Criteria
 
 **Automated Verification:**
-- `cd crates/physicall-core && wasm-pack build --target web --out-dir pkg` — builds
-- `cd web && npm run build` — builds
+- [x] `cd crates/physicall-core && wasm-pack build --target web --out-dir pkg` — builds
+- [x] `cd web && npm run build` — builds
 
 **Manual Verification:**
 - [ ] Selecting "Soft Body" shows a circular ring of particles

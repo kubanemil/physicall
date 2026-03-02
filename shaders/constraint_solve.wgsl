@@ -110,12 +110,22 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     if (correction_count > 0u) {
         particles[idx].position += correction;
-        // Update velocity to reflect constraint correction.
-        // Without this, velocity diverges from actual position changes
-        // (gravity keeps accelerating while constraints snap positions back).
-        // Scale by 0.5 to avoid over-damping — partial velocity update.
+        // Partially update velocity to reflect constraint correction.
+        // This prevents velocity from diverging from position (cloth exploding),
+        // but must be gentle enough to preserve kinetic energy (soft body bounce).
         if (params.delta_time > 0.0001) {
-            particles[idx].velocity += correction / params.delta_time * 0.3;
+            particles[idx].velocity += correction / params.delta_time * 0.1;
+        }
+    }
+
+    // Floor enforcement after constraint correction.
+    // Without this, constraints can push particles below the floor
+    // (physics shader enforces floor, then constraints undo it).
+    let floor_limit = params.floor_y + particles[idx].size;
+    if (particles[idx].position.y < floor_limit) {
+        particles[idx].position.y = floor_limit;
+        if (particles[idx].velocity.y < 0.0) {
+            particles[idx].velocity.y = -particles[idx].velocity.y * params.restitution;
         }
     }
 }
