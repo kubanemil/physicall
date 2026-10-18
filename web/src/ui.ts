@@ -16,8 +16,8 @@ export interface SceneSpec {
   params: ParamSpec[];
 }
 
-/// Sliders for one scene. Log parameters slide over their exponent; rebuild
-/// parameters apply when the slider is released, live ones while it moves.
+// Log parameters slide over their exponent. Rebuild parameters apply when the
+// slider is released, live ones while it moves.
 export function buildParams(
   container: HTMLElement,
   scene: SceneSpec,

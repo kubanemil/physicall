@@ -1,11 +1,6 @@
-//! The GPU kernels against the CPU reference. These need a GPU adapter (a
-//! software one such as lavapipe works). Without one they print a notice and
-//! pass, unless PHYSICALL_REQUIRE_GPU is set, as it is in CI.
-//!
-//! Each tolerance is three to nine times the gap measured on lavapipe; the
-//! rope matches exactly there and gets a few ULP at its 2 m scale. Other GPUs
-//! may round sqrt and division differently (WGSL allows 2.5 ULP) and fuse
-//! multiply-adds, which that headroom covers.
+// Tolerances are three to nine times the gap measured on lavapipe (the rope
+// gets a few ULP at its 2 m scale). Other GPUs may round sqrt and division
+// less exactly (WGSL allows 2.5 ULP) and fuse multiply-adds.
 
 use physicall_core::Vec3;
 use physicall_core::constraint::ColouredConstraints;
@@ -65,7 +60,6 @@ fn xpbd_scene(kind: SceneKind, tweak: impl FnOnce(&mut Settings)) -> scene::Xpbd
     }
 }
 
-/// Runs `steps` fixed steps on both solvers and returns both final states.
 fn run_both(
     particles: &Particles,
     constraints: &ColouredConstraints,

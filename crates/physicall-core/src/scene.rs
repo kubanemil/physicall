@@ -1,5 +1,3 @@
-//! Demo scenes and their tunable parameters.
-
 use glam::Vec3;
 
 use crate::constraint::{ColouredConstraints, DistanceConstraint, Material};
@@ -179,7 +177,6 @@ pub enum Change {
     Rebuild,
 }
 
-/// Current parameter values for one scene kind.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     kind: SceneKind,

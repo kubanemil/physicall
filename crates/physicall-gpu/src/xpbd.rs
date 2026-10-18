@@ -1,5 +1,3 @@
-//! The XPBD solver of `physicall_core::xpbd` as wgpu compute passes.
-
 use glam::Vec3;
 use physicall_core::constraint::ColouredConstraints;
 use physicall_core::hash::SpatialHash;

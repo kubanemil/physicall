@@ -1,6 +1,3 @@
-// Counting-sort spatial hash (clear, count, two-level scan, scatter, optional
-// sort) and the Jacobi particle contact pass that reads it.
-
 @group(1) @binding(0) var<storage, read_write> cell_start: array<atomic<u32>>;
 @group(1) @binding(1) var<storage, read_write> entries: array<vec2<u32>>;
 @group(1) @binding(2) var<storage, read_write> sorted: array<u32>;
