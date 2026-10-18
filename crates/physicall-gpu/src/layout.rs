@@ -1,7 +1,3 @@
-//! Structs shared by Rust and WGSL. Each is declared once; the macro emits
-//! the `#[repr(C)]` Rust type, its WGSL source for the shader prelude, and
-//! compile-time asserts that Rust offsets and size follow WGSL layout rules.
-
 #[doc(hidden)]
 #[macro_export]
 macro_rules! wgsl_type {

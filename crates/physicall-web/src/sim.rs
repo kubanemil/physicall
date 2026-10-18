@@ -1,5 +1,3 @@
-//! A scene's GPU simulation, its draw data and its diagnostics.
-
 use glam::Vec3;
 use physicall_core::constraint::Material;
 use physicall_core::diagnostics::{self, Diagnostics};

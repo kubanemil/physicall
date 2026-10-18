@@ -1,5 +1,3 @@
-//! The leapfrog N-body solver of `physicall_core::nbody` as wgpu compute passes.
-
 use physicall_core::nbody::NBodyParams;
 use physicall_core::particles::Particles;
 

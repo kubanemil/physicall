@@ -1,5 +1,4 @@
-// Particle state shared by every XPBD kernel. Mirrors physicall-core's xpbd
-// and contact modules; pos.w holds the inverse mass, 0 for static particles.
+// pos.w holds the inverse mass, 0 for static particles.
 
 @group(0) @binding(0) var<uniform> params: XpbdUniforms;
 @group(0) @binding(1) var<storage, read_write> pos: array<vec4<f32>>;

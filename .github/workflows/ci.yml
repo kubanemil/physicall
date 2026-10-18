@@ -23,7 +23,7 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install lavapipe, a software Vulkan driver, so the GPU tests run
+      - name: Install lavapipe for the GPU tests
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
       - run: ./do check
       - run: ./do test

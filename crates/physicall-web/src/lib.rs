@@ -1,7 +1,3 @@
-//! WebAssembly bindings for the physicall demo. `App` owns the WebGPU device,
-//! the running simulation and the renderer; the page forwards input to it and
-//! calls `frame` once per animation frame.
-
 mod camera;
 mod catalog;
 mod picking;
@@ -495,9 +491,7 @@ mod tests {
         pollster::block_on(adapter.request_device(&Default::default())).ok()
     }
 
-    /// Renders `frames` frames of a scene offscreen and returns RGBA pixels
-    /// plus the diagnostics from the last readback.
-    pub(crate) fn render(
+    fn render(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         settings: &Settings,
