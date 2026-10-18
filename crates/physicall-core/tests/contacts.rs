@@ -95,7 +95,7 @@ fn friction_stops_a_sliding_particle_on_the_floor() {
         sim.particles.vel[0]
     );
     assert!(
-        (travelled - 1.0 / (2.0 * 0.5 * 9.81)).abs() < 0.02,
+        (travelled - 1.0 / (2.0 * 0.5 * 9.81)).abs() < 0.005,
         "slid {travelled:.3} m"
     );
 }
