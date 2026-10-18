@@ -1,0 +1,26 @@
+[package]
+name = "physicall-gpu"
+description = "wgpu compute pipelines that mirror the physicall-core solvers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+physicall-core.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgpu"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = { workspace = true, features = ["vulkan", "metal", "dx12"] }
+
+[dev-dependencies]
+naga.workspace = true
+pollster.workspace = true
+
+[lints]
+workspace = true
