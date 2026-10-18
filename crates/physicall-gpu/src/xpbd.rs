@@ -38,7 +38,7 @@ pub fn uniforms(params: &XpbdParams, count: u32, table_size: u32) -> XpbdUniform
         count,
         table_size,
         flags,
-        pad: 0,
+        inv_cell_size: k.inv_cell_size,
     }
 }
 
@@ -53,7 +53,9 @@ pub struct XpbdKernels {
     solve: wgpu::ComputePipeline,
     hash_clear: wgpu::ComputePipeline,
     hash_count: wgpu::ComputePipeline,
-    hash_scan: wgpu::ComputePipeline,
+    hash_scan_blocks: wgpu::ComputePipeline,
+    hash_scan_sums: wgpu::ComputePipeline,
+    hash_scan_add: wgpu::ComputePipeline,
     hash_scatter: wgpu::ComputePipeline,
     hash_sort: wgpu::ComputePipeline,
     contacts: wgpu::ComputePipeline,
@@ -105,7 +107,9 @@ impl XpbdKernels {
             solve: util::compute_pipeline(device, &solve_layout, &solve, "solve_distance"),
             hash_clear: on_grid("hash_clear"),
             hash_count: on_grid("hash_count"),
-            hash_scan: on_grid("hash_scan"),
+            hash_scan_blocks: on_grid("hash_scan_blocks"),
+            hash_scan_sums: on_grid("hash_scan_sums"),
+            hash_scan_add: on_grid("hash_scan_add"),
             hash_scatter: on_grid("hash_scatter"),
             hash_sort: on_grid("hash_sort"),
             contacts: on_grid("contacts"),
@@ -123,6 +127,7 @@ pub struct XpbdGpu {
     params: XpbdParams,
     count: u32,
     table_size: u32,
+    deterministic: bool,
     pos: wgpu::Buffer,
     vel: wgpu::Buffer,
     uniforms: wgpu::Buffer,
@@ -218,7 +223,9 @@ impl XpbdGpu {
             })
         };
         let n = u64::from(count);
-        let cell_start = grid_buffer("cell start", 4 * (u64::from(table_size) + 1));
+        // Bucket offsets, the end marker, then one partial sum per scan block.
+        let scan_blocks = table_size.div_ceil(SCAN_THREADS);
+        let cell_start = grid_buffer("cell start", 4 * u64::from(table_size + 1 + scan_blocks));
         let entries = grid_buffer("cell entries", 8 * n);
         let sorted = grid_buffer("sorted", 4 * n);
         let delta = grid_buffer("delta", 16 * n);
@@ -264,6 +271,7 @@ impl XpbdGpu {
             params: *params,
             count,
             table_size,
+            deterministic: false,
             pos,
             vel,
             uniforms,
@@ -275,6 +283,14 @@ impl XpbdGpu {
             constraints_group,
             grid_group,
         }
+    }
+
+    /// Sorts every hash bucket by particle index each substep, so contact
+    /// sums add up in a fixed order: runs repeat exactly and follow the CPU's
+    /// summation order. Costs a dispatch and O(k²) per bucket of k particles.
+    pub fn deterministic(mut self) -> Self {
+        self.deterministic = true;
+        self
     }
 
     pub fn count(&self) -> u32 {
@@ -314,6 +330,7 @@ impl XpbdGpu {
         let particles = self.count.div_ceil(WORKGROUP_SIZE);
         let table = (self.table_size + 1).div_ceil(WORKGROUP_SIZE);
         let buckets = self.table_size.div_ceil(WORKGROUP_SIZE);
+        let scan_blocks = self.table_size.div_ceil(SCAN_THREADS);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("xpbd"),
             timestamp_writes: None,
@@ -336,9 +353,13 @@ impl XpbdGpu {
                 pass.set_bind_group(1, &self.grid_group, &[]);
                 run(&mut pass, &k.hash_clear, table);
                 run(&mut pass, &k.hash_count, particles);
-                run(&mut pass, &k.hash_scan, 1);
+                run(&mut pass, &k.hash_scan_blocks, scan_blocks);
+                run(&mut pass, &k.hash_scan_sums, 1);
+                run(&mut pass, &k.hash_scan_add, scan_blocks);
                 run(&mut pass, &k.hash_scatter, particles);
-                run(&mut pass, &k.hash_sort, buckets);
+                if self.deterministic {
+                    run(&mut pass, &k.hash_sort, buckets);
+                }
                 for _ in 0..self.params.contact_iterations {
                     run(&mut pass, &k.contacts, particles);
                     run(&mut pass, &k.apply_delta, particles);
@@ -350,4 +371,7 @@ impl XpbdGpu {
     }
 }
 
-const _: () = assert!(SCAN_THREADS <= 256, "the scan runs in one workgroup");
+const _: () = assert!(
+    SCAN_THREADS <= 256,
+    "WebGPU guarantees 256 invocations per workgroup"
+);

@@ -1,6 +1,11 @@
 //! The GPU kernels against the CPU reference. These need a GPU adapter (a
 //! software one such as lavapipe works). Without one they print a notice and
 //! pass, unless PHYSICALL_REQUIRE_GPU is set, as it is in CI.
+//!
+//! Each tolerance is three to nine times the gap measured on lavapipe; the
+//! rope matches exactly there and gets a few ULP at its 2 m scale. Other GPUs
+//! may round sqrt and division differently (WGSL allows 2.5 ULP) and fuse
+//! multiply-adds, which that headroom covers.
 
 use physicall_core::Vec3;
 use physicall_core::constraint::ColouredConstraints;
@@ -10,7 +15,7 @@ use physicall_core::nbody::NBody;
 use physicall_core::particles::Particles;
 use physicall_core::rng::Rng;
 use physicall_core::scene::{self, Scene, SceneKind, Settings};
-use physicall_core::xpbd::{Xpbd, XpbdParams};
+use physicall_core::xpbd::{Substep, Xpbd, XpbdParams};
 use physicall_gpu::nbody::{NBodyGpu, NBodyKernels};
 use physicall_gpu::pack::unpack;
 use physicall_gpu::readback::read_buffers;
@@ -87,8 +92,8 @@ fn scene_gap(scene: &scene::XpbdScene, steps: u32) -> Option<f32> {
     Some(max_distance(&gpu_pos, &cpu.particles.pos))
 }
 
-// Both runs start one rounding step apart (GPUs fuse multiply-adds) and a
-// folding cloth amplifies that, so compare over a third of a second.
+// A folding cloth amplifies rounding differences, so compare over a third of
+// a second.
 #[test]
 fn gpu_cloth_matches_the_cpu_reference() {
     let scene = xpbd_scene(SceneKind::Cloth, |s| {
@@ -96,7 +101,7 @@ fn gpu_cloth_matches_the_cpu_reference() {
     });
     if let Some(gap) = scene_gap(&scene, 20) {
         assert!(
-            gap < 5e-4,
+            gap < 2e-4,
             "GPU cloth drifted {gap:.2e} m from the CPU reference"
         );
     }
@@ -107,7 +112,7 @@ fn gpu_rope_matches_the_cpu_reference() {
     let scene = xpbd_scene(SceneKind::Rope, |_| {});
     if let Some(gap) = scene_gap(&scene, 60) {
         assert!(
-            gap < 1e-4,
+            gap < 1e-6,
             "GPU rope drifted {gap:.2e} m from the CPU reference"
         );
     }
@@ -138,7 +143,7 @@ fn gpu_contacts_match_the_cpu_reference_for_isolated_collisions() {
     {
         let gap = max_distance(&gpu_pos, &cpu.particles.pos);
         assert!(
-            gap < 1e-4,
+            gap < 1e-5,
             "GPU collisions drifted {gap:.2e} m from the CPU reference"
         );
     }
@@ -157,12 +162,12 @@ fn gpu_pile_settles_like_the_cpu_reference() {
     let mean_height = |pos: &[Vec3]| pos.iter().map(|p| p.y).sum::<f32>() / pos.len() as f32;
     let (g, c) = (mean_height(&gpu_pos), mean_height(&cpu.particles.pos));
     assert!(
-        (g - c).abs() < 0.02 * c,
+        (g - c).abs() < 0.01 * c,
         "mean height {g:.4} m on GPU vs {c:.4} m on CPU"
     );
     let r = scene.params.radius;
     let mut hash = SpatialHash::new(SpatialHash::table_size_for(gpu_pos.len()));
-    hash.build(&gpu_pos, 2.0 * r);
+    hash.build(&gpu_pos, 1.0 / (2.0 * r));
     for i in 0..gpu_pos.len() {
         for j in hash.neighbours(&gpu_pos, i, 2.0 * r) {
             let overlap = 2.0 * r - gpu_pos[i].distance(gpu_pos[j as usize]);
@@ -173,6 +178,35 @@ fn gpu_pile_settles_like_the_cpu_reference() {
             );
         }
     }
+}
+
+/// Runs one substep with no motion, so the GPU hash reflects the start
+/// positions, and returns its bucket offsets and sorted indices.
+fn gpu_hash(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    particles: &Particles,
+    params: &XpbdParams,
+    deterministic: bool,
+) -> (Vec<u32>, Vec<u32>) {
+    let kernels = XpbdKernels::new(device);
+    let mut sim = XpbdGpu::new(
+        device,
+        &kernels,
+        particles,
+        &ColouredConstraints::default(),
+        params,
+    );
+    if deterministic {
+        sim = sim.deterministic();
+    }
+    let mut encoder = device.create_command_encoder(&Default::default());
+    sim.encode(&mut encoder, 1);
+    queue.submit([encoder.finish()]);
+    let (cell_start, sorted) = sim.hash();
+    let start = bytemuck::pod_collect_to_vec(&read_buffers(device, queue, &[cell_start]));
+    let sorted = bytemuck::pod_collect_to_vec(&read_buffers(device, queue, &[sorted]));
+    (start, sorted)
 }
 
 #[test]
@@ -191,34 +225,27 @@ fn gpu_spatial_hash_matches_the_cpu_hash() {
         self_collision: true,
         ..XpbdParams::default()
     };
-    let kernels = XpbdKernels::new(&device);
-    let sim = XpbdGpu::new(
-        &device,
-        &kernels,
-        &particles,
-        &ColouredConstraints::default(),
-        &params,
-    );
-    let mut encoder = device.create_command_encoder(&Default::default());
-    sim.encode(&mut encoder, 1);
-    queue.submit([encoder.finish()]);
-    let (cell_start, sorted) = sim.hash();
-    let gpu_start: Vec<u32> =
-        bytemuck::pod_collect_to_vec(&read_buffers(&device, &queue, &[cell_start]));
-    let gpu_sorted: Vec<u32> =
-        bytemuck::pod_collect_to_vec(&read_buffers(&device, &queue, &[sorted]));
-
     let mut cpu = SpatialHash::new(SpatialHash::table_size_for(particles.len()));
-    cpu.build(&particles.pos, 2.0 * params.radius);
+    cpu.build(&particles.pos, Substep::new(&params).inv_cell_size);
+    let n = cpu.cell_start().len();
+    assert!(n > 8 * 256, "the table should span several scan blocks");
+
+    // Without sorting, atomics fill buckets in any order: compare them as sets.
+    let (start, sorted) = gpu_hash(&device, &queue, &particles, &params, false);
+    assert_eq!(&start[..n], cpu.cell_start(), "bucket offsets differ");
+    for w in cpu.cell_start().windows(2) {
+        let range = w[0] as usize..w[1] as usize;
+        let mut g = sorted[range.clone()].to_vec();
+        g.sort_unstable();
+        assert_eq!(g, cpu.sorted()[range], "bucket contents differ");
+    }
+
+    let (start, sorted) = gpu_hash(&device, &queue, &particles, &params, true);
+    assert_eq!(&start[..n], cpu.cell_start(), "bucket offsets differ");
     assert_eq!(
-        &gpu_start[..cpu.cell_start().len()],
-        cpu.cell_start(),
-        "bucket offsets differ"
-    );
-    assert_eq!(
-        &gpu_sorted[..particles.len()],
+        sorted,
         cpu.sorted(),
-        "bucket contents differ"
+        "deterministic buckets are not in index order"
     );
 }
 
@@ -243,7 +270,7 @@ fn gpu_nbody_matches_the_cpu_reference() {
     }
     let gap = max_distance(&gpu_pos, &cpu.particles.pos);
     assert!(
-        gap < 1e-4,
+        gap < 1e-6,
         "GPU bodies drifted {gap:.2e} from the CPU reference"
     );
     let worst = gpu_potential
@@ -251,5 +278,5 @@ fn gpu_nbody_matches_the_cpu_reference() {
         .zip(&cpu.potential)
         .map(|(g, c)| ((g - c) / c).abs())
         .fold(0.0, f32::max);
-    assert!(worst < 1e-4, "GPU potentials differ by {worst:.2e}");
+    assert!(worst < 1e-6, "GPU potentials differ by {worst:.2e}");
 }

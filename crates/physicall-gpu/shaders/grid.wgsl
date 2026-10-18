@@ -1,5 +1,5 @@
-// Counting-sort spatial hash (clear, count, scan, scatter) and the Jacobi
-// particle contact pass that reads it.
+// Counting-sort spatial hash (clear, count, two-level scan, scatter, optional
+// sort) and the Jacobi particle contact pass that reads it.
 
 @group(1) @binding(0) var<storage, read_write> cell_start: array<atomic<u32>>;
 @group(1) @binding(1) var<storage, read_write> entries: array<vec2<u32>>;
@@ -7,7 +7,7 @@
 @group(1) @binding(3) var<storage, read_write> delta: array<vec4<f32>>;
 
 fn cell_of(p: vec3<f32>) -> vec3<i32> {
-    return vec3<i32>(floor(p / (2.0 * params.radius)));
+    return vec3<i32>(floor(p * params.inv_cell_size));
 }
 
 // Teschner et al. 2003; u32 multiplication wraps like Rust's wrapping_mul.
@@ -33,23 +33,15 @@ fn hash_count(@builtin(global_invocation_id) id: vec3<u32>) {
     entries[i] = vec2<u32>(b, atomicAdd(&cell_start[b], 1u));
 }
 
+// Block sums live after the table's end marker in the cell_start buffer.
+fn block_sum(block: u32) -> u32 {
+    return params.table_size + 1u + block;
+}
+
 var<workgroup> partial: array<u32, SCAN_THREADS>;
 
-// Exclusive prefix sum of bucket counts in one workgroup: each thread sums a
-// contiguous run, a Hillis-Steele scan combines the runs, then each thread
-// writes its run's offsets. cell_start[table_size] ends up as the total.
-@compute @workgroup_size(SCAN_THREADS)
-fn hash_scan(@builtin(local_invocation_index) t: u32) {
-    let n = params.table_size;
-    let per = (n + SCAN_THREADS - 1u) / SCAN_THREADS;
-    let begin = min(t * per, n);
-    let end = min(begin + per, n);
-    var sum = 0u;
-    for (var c = begin; c < end; c++) {
-        sum += atomicLoad(&cell_start[c]);
-    }
-    partial[t] = sum;
-    workgroupBarrier();
+// Inclusive Hillis-Steele scan of `partial` across the workgroup.
+fn scan_partial(t: u32) {
     for (var offset = 1u; offset < SCAN_THREADS; offset <<= 1u) {
         var add = 0u;
         if t >= offset {
@@ -59,14 +51,63 @@ fn hash_scan(@builtin(local_invocation_index) t: u32) {
         partial[t] += add;
         workgroupBarrier();
     }
-    var running = partial[t] - sum;
-    for (var c = begin; c < end; c++) {
-        let count = atomicLoad(&cell_start[c]);
-        atomicStore(&cell_start[c], running);
-        running += count;
+}
+
+// Two-level exclusive prefix sum of bucket counts. First, each workgroup
+// scans its block of SCAN_THREADS buckets and records the block total.
+@compute @workgroup_size(SCAN_THREADS)
+fn hash_scan_blocks(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(local_invocation_index) t: u32,
+    @builtin(workgroup_id) block: vec3<u32>,
+) {
+    let c = id.x;
+    var count = 0u;
+    if c < params.table_size {
+        count = atomicLoad(&cell_start[c]);
+    }
+    partial[t] = count;
+    workgroupBarrier();
+    scan_partial(t);
+    if c < params.table_size {
+        atomicStore(&cell_start[c], partial[t] - count);
     }
     if t == SCAN_THREADS - 1u {
-        atomicStore(&cell_start[n], partial[t]);
+        atomicStore(&cell_start[block_sum(block.x)], partial[t]);
+    }
+}
+
+// Then one workgroup turns block totals into block offsets and writes the
+// grand total to cell_start[table_size].
+@compute @workgroup_size(SCAN_THREADS)
+fn hash_scan_sums(@builtin(local_invocation_index) t: u32) {
+    let blocks = (params.table_size + SCAN_THREADS - 1u) / SCAN_THREADS;
+    let per = (blocks + SCAN_THREADS - 1u) / SCAN_THREADS;
+    let begin = min(t * per, blocks);
+    let end = min(begin + per, blocks);
+    var sum = 0u;
+    for (var b = begin; b < end; b++) {
+        sum += atomicLoad(&cell_start[block_sum(b)]);
+    }
+    partial[t] = sum;
+    workgroupBarrier();
+    scan_partial(t);
+    var running = partial[t] - sum;
+    for (var b = begin; b < end; b++) {
+        let total = atomicLoad(&cell_start[block_sum(b)]);
+        atomicStore(&cell_start[block_sum(b)], running);
+        running += total;
+    }
+    if t == SCAN_THREADS - 1u {
+        atomicStore(&cell_start[params.table_size], partial[t]);
+    }
+}
+
+// Finally each bucket adds its block's offset.
+@compute @workgroup_size(SCAN_THREADS)
+fn hash_scan_add(@builtin(global_invocation_id) id: vec3<u32>, @builtin(workgroup_id) block: vec3<u32>) {
+    if id.x < params.table_size {
+        atomicAdd(&cell_start[id.x], atomicLoad(&cell_start[block_sum(block.x)]));
     }
 }
 
@@ -80,9 +121,9 @@ fn hash_scatter(@builtin(global_invocation_id) id: vec3<u32>) {
     sorted[atomicLoad(&cell_start[e.x]) + e.y] = i;
 }
 
-// Atomics fill each bucket in arbitrary order. Sorting by index makes contact
-// sums add up in the CPU's order, so runs are reproducible. Buckets hold a
-// handful of particles, so insertion sort is enough.
+// Optional. Atomics fill each bucket in arbitrary order; sorting by index makes
+// contact sums add up in the CPU's order, so runs repeat exactly. Buckets hold
+// a handful of particles, so insertion sort is enough.
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn hash_sort(@builtin(global_invocation_id) id: vec3<u32>) {
     let b = id.x;

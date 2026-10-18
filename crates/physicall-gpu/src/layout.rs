@@ -135,7 +135,7 @@ gpu_structs! {
         pub count: u32,
         pub table_size: u32,
         pub flags: u32,
-        pub pad: u32,
+        pub inv_cell_size: f32,
     }
 
     pub struct ColourRange {
@@ -211,7 +211,7 @@ mod tests {
             count,
             table_size,
             flags,
-            pad
+            inv_cell_size
         });
         assert_layout!(ColourRange {
             first,
