@@ -1,3 +1,8 @@
+/// Length of one substep. The CPU and GPU solvers both take it from here.
+pub fn substep(dt: f32, substeps: u32) -> f32 {
+    dt / substeps.max(1) as f32
+}
+
 /// Turns variable frame times into a whole number of fixed steps, so the
 /// simulation result depends only on simulated time, not on frame rate.
 #[derive(Clone, Debug)]

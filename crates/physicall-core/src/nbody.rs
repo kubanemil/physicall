@@ -3,6 +3,7 @@
 
 use glam::Vec3;
 
+use crate::clock;
 use crate::diagnostics::{self, Diagnostics};
 use crate::particles::Particles;
 
@@ -16,7 +17,7 @@ pub struct NBodyParams {
 
 impl NBodyParams {
     pub fn substep(&self) -> f32 {
-        self.dt / self.substeps.max(1) as f32
+        clock::substep(self.dt, self.substeps)
     }
 }
 

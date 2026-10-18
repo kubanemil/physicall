@@ -4,8 +4,11 @@ use glam::{IVec3, Vec3};
 /// Collision Detection of Deformable Objects".
 pub const PRIMES: [u32; 3] = [73_856_093, 19_349_663, 83_492_791];
 
-pub fn cell_of(p: Vec3, cell_size: f32) -> IVec3 {
-    (p / cell_size).floor().as_ivec3()
+/// Multiplies by the inverse cell size: multiplication is exactly rounded on
+/// every GPU, while WGSL division may be 2.5 ULP off, which would put a
+/// particle on a cell boundary in a different cell than the CPU does.
+pub fn cell_of(p: Vec3, inv_cell_size: f32) -> IVec3 {
+    (p * inv_cell_size).floor().as_ivec3()
 }
 
 pub fn bucket(cell: IVec3, table_size: u32) -> u32 {
@@ -22,7 +25,7 @@ pub fn bucket(cell: IVec3, table_size: u32) -> u32 {
 #[derive(Clone, Debug)]
 pub struct SpatialHash {
     table_size: u32,
-    cell_size: f32,
+    inv_cell_size: f32,
     cell_start: Vec<u32>,
     entries: Vec<[u32; 2]>,
     sorted: Vec<u32>,
@@ -33,7 +36,7 @@ impl SpatialHash {
         assert!(table_size > 0, "hash table needs at least one bucket");
         Self {
             table_size,
-            cell_size: 1.0,
+            inv_cell_size: 1.0,
             cell_start: vec![0; table_size as usize + 1],
             entries: Vec::new(),
             sorted: Vec::new(),
@@ -49,8 +52,8 @@ impl SpatialHash {
         self.table_size
     }
 
-    pub fn cell_size(&self) -> f32 {
-        self.cell_size
+    pub fn inv_cell_size(&self) -> f32 {
+        self.inv_cell_size
     }
 
     pub fn cell_start(&self) -> &[u32] {
@@ -61,12 +64,12 @@ impl SpatialHash {
         &self.sorted
     }
 
-    pub fn build(&mut self, pos: &[Vec3], cell_size: f32) {
-        self.cell_size = cell_size;
+    pub fn build(&mut self, pos: &[Vec3], inv_cell_size: f32) {
+        self.inv_cell_size = inv_cell_size;
         self.cell_start.fill(0);
         self.entries.clear();
         for &p in pos {
-            let b = bucket(cell_of(p, cell_size), self.table_size) as usize;
+            let b = bucket(cell_of(p, inv_cell_size), self.table_size) as usize;
             self.entries.push([b as u32, self.cell_start[b]]);
             self.cell_start[b] += 1;
         }
@@ -88,7 +91,7 @@ impl SpatialHash {
     /// Calls `f` for every particle in the 27 cells around `p`. Buckets shared
     /// by two of those cells are visited once, so no candidate repeats.
     pub fn for_each_candidate(&self, p: Vec3, mut f: impl FnMut(u32)) {
-        let base = cell_of(p, self.cell_size);
+        let base = cell_of(p, self.inv_cell_size);
         let mut visited = [0u32; 27];
         let mut visited_count = 0;
         for dz in -1..=1 {

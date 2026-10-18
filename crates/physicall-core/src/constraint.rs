@@ -55,20 +55,21 @@ pub struct ColouredConstraints {
 
 impl ColouredConstraints {
     /// Greedy colouring in input order, then a stable counting sort by colour.
+    /// Each particle's used colours fit in a 64-bit mask, which holds as long
+    /// as no two linked particles have more than 64 constraints between them.
     pub fn new(inv_mass: &[f32], constraints: Vec<DistanceConstraint>) -> Self {
-        let mut used: Vec<Vec<u32>> = vec![Vec::new(); inv_mass.len()];
+        let mut used = vec![0u64; inv_mass.len()];
         let mut colour_of = Vec::with_capacity(constraints.len());
         for c in &constraints {
-            let moving: Vec<usize> = [c.a as usize, c.b as usize]
-                .into_iter()
-                .filter(|&p| inv_mass[p] > 0.0)
-                .collect();
-            let mut colour = 0;
-            while moving.iter().any(|&p| used[p].contains(&colour)) {
-                colour += 1;
-            }
-            for &p in &moving {
-                used[p].push(colour);
+            let moving = [c.a as usize, c.b as usize].map(|p| (inv_mass[p] > 0.0).then_some(p));
+            let taken = moving.iter().flatten().fold(0, |mask, &p| mask | used[p]);
+            assert!(
+                taken != u64::MAX,
+                "constraint graph needs more than 64 colours"
+            );
+            let colour = (!taken).trailing_zeros();
+            for &p in moving.iter().flatten() {
+                used[p] |= 1 << colour;
             }
             colour_of.push(colour);
         }

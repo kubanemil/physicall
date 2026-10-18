@@ -42,7 +42,7 @@ fn falling_pile_comes_to_rest_without_deep_overlaps() {
 
     let p = &sim.particles;
     let mut hash = SpatialHash::new(SpatialHash::table_size_for(p.len()));
-    hash.build(&p.pos, 2.0 * RADIUS);
+    hash.build(&p.pos, 1.0 / (2.0 * RADIUS));
     let worst = (0..p.len())
         .flat_map(|i| {
             hash.neighbours(&p.pos, i, 2.0 * RADIUS)
@@ -100,8 +100,10 @@ fn friction_stops_a_sliding_particle_on_the_floor() {
     );
 }
 
+// Contacts are fully inelastic (no restitution), so equal particles meeting
+// head-on stop where they touch.
 #[test]
-fn equal_particles_swap_momentum_in_a_head_on_collision_without_losing_it() {
+fn head_on_equal_particles_stop_dead_without_passing_through() {
     let mut p = Particles::default();
     p.push(Vec3::new(-0.1, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 1.0);
     p.push(Vec3::new(0.1, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0), 1.0);
@@ -116,10 +118,12 @@ fn equal_particles_swap_momentum_in_a_head_on_collision_without_losing_it() {
         sim.step(&params);
     }
     let p = &sim.particles;
-    let momentum = diagnostics::momentum(&p.vel, &p.inv_mass);
-    assert!(momentum.length() < 1e-6, "net momentum {momentum}");
+    for v in &p.vel {
+        assert!(v.length() < 1e-4, "a particle still moves at {v}");
+    }
+    let gap = p.pos[1].x - p.pos[0].x;
     assert!(
-        p.pos[0].distance(p.pos[1]) >= 2.0 * RADIUS - 1e-4,
-        "particles passed through each other"
+        gap >= 2.0 * RADIUS - 1e-4,
+        "centres {gap:.4} m apart, closer than one diameter"
     );
 }

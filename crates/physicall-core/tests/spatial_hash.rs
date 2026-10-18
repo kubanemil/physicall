@@ -11,7 +11,7 @@ fn brute_force(pos: &[Vec3], i: usize, radius: f32) -> Vec<u32> {
 
 fn check(pos: &[Vec3], radius: f32, table_size: u32) {
     let mut hash = SpatialHash::new(table_size);
-    hash.build(pos, radius);
+    hash.build(pos, 1.0 / radius);
     for i in 0..pos.len() {
         let mut found = hash.neighbours(pos, i, radius);
         found.sort_unstable();
@@ -48,7 +48,7 @@ fn hash_buckets_partition_all_particles() {
     let mut rng = Rng::new(7);
     let pos: Vec<Vec3> = (0..1000).map(|_| rng.in_cube(1.0)).collect();
     let mut hash = SpatialHash::new(512);
-    hash.build(&pos, 0.1);
+    hash.build(&pos, 10.0);
     let starts = hash.cell_start();
     assert_eq!(starts[0], 0);
     assert_eq!(*starts.last().unwrap_or(&0) as usize, pos.len());

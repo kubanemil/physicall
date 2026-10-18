@@ -4,6 +4,7 @@
 
 use glam::Vec3;
 
+use crate::clock;
 use crate::constraint::ColouredConstraints;
 use crate::contact::{self, Bounds};
 use crate::hash::SpatialHash;
@@ -59,16 +60,19 @@ pub struct Substep {
     pub damping: f32,
     /// Compliance divided by h², the alpha-tilde of the XPBD paper.
     pub alpha: [f32; 4],
+    /// The contact grid's cells are one particle diameter wide.
+    pub inv_cell_size: f32,
 }
 
 impl Substep {
     pub fn new(params: &XpbdParams) -> Self {
-        let h = params.dt / params.substeps.max(1) as f32;
+        let h = clock::substep(params.dt, params.substeps);
         Self {
             h,
             inv_h: 1.0 / h,
             damping: (-params.drag * h).exp(),
             alpha: params.compliance.map(|c| c / (h * h)),
+            inv_cell_size: 1.0 / (2.0 * params.radius),
         }
     }
 }
@@ -180,7 +184,7 @@ impl Xpbd {
         }
 
         if params.self_collision {
-            self.hash.build(&p.pos, 2.0 * params.radius);
+            self.hash.build(&p.pos, k.inv_cell_size);
             for _ in 0..params.contact_iterations {
                 for i in 0..p.len() {
                     self.delta[i] = contact::contact_delta(
