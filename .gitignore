@@ -1,29 +1,12 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 
-# WASM build artifacts
+# WebAssembly and web build output
 **/pkg/
-
-# Node.js
 node_modules/
-.npm
-
-# Vite
 dist/
 *.local
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
 
 # Environment
 .env
@@ -33,3 +16,12 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

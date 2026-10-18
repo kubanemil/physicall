@@ -1,33 +1,13 @@
 [package]
 name = "physicall-core"
+description = "GPU-free XPBD and N-body reference solvers, spatial hash and scene builders"
 version.workspace = true
 edition.workspace = true
-
-[lib]
-crate-type = ["cdylib", "rlib"]
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
-wasm-bindgen = { workspace = true }
-wasm-bindgen-futures = { workspace = true }
-console_error_panic_hook = { workspace = true, optional = true }
-wgpu = { workspace = true }
-bytemuck = { workspace = true }
-glam = { workspace = true }
+glam.workspace = true
 
-[dependencies.web-sys]
+[lints]
 workspace = true
-features = [
-    "console",
-    "Window",
-    "Document",
-    "Element",
-    "HtmlCanvasElement",
-    "MouseEvent",
-    "WheelEvent",
-    "EventTarget",
-    "AddEventListenerOptions",
-    "Performance",
-]
-
-[features]
-default = ["console_error_panic_hook"]

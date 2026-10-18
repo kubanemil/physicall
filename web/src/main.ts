@@ -1,337 +1,165 @@
-import init, {
-  init_webgpu,
-  render,
-  resize,
-  reset_camera,
-  set_paused,
-  reset_simulation,
-  reset_simulation_with_count,
-  set_gravity,
-  set_time_scale,
-  set_initial_speed,
-  get_particle_count,
-  set_simulation_mode,
-  set_stiffness,
-  set_pressure,
-} from '../../crates/physicall-core/pkg/physicall_core';
-
-interface WebGPUCheckResult {
-  supported: boolean;
-  error?: string;
-}
-
-async function checkWebGPUSupport(): Promise<WebGPUCheckResult> {
-  // Check secure context (HTTPS or localhost required)
-  if (!window.isSecureContext) {
-    return {
-      supported: false,
-      error: 'WebGPU requires a secure connection (HTTPS or localhost).',
-    };
-  }
-
-  // Check if navigator.gpu exists
-  if (!navigator.gpu) {
-    return {
-      supported: false,
-      error: getBrowserSpecificError(),
-    };
-  }
-
-  // Try to get an adapter to verify GPU is available
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-      return {
-        supported: false,
-        error: 'No WebGPU adapter available. Your GPU may not be supported, or hardware acceleration may be disabled.',
-      };
-    }
-    return { supported: true };
-  } catch (e) {
-    return {
-      supported: false,
-      error: `WebGPU initialization failed: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-}
-
-function getBrowserSpecificError(): string {
-  const ua = navigator.userAgent.toLowerCase();
-
-  if (ua.includes('firefox')) {
-    return 'WebGPU is not enabled in Firefox. Please update to Firefox 141+ (Windows) or Firefox 145+ (macOS), or enable WebGPU in about:config.';
-  }
-  if (ua.includes('safari') && !ua.includes('chrome')) {
-    return 'WebGPU requires Safari 26+ on macOS/iOS 26+. Please update your operating system and browser.';
-  }
-  if (ua.includes('chrome') || ua.includes('chromium') || ua.includes('edg')) {
-    return 'WebGPU requires Chrome/Edge 113+. Please update your browser and ensure "Use graphics acceleration" is enabled in Settings.';
-  }
-
-  return 'Your browser does not support WebGPU. Please try Chrome 113+, Firefox 141+, or Safari 26+.';
-}
-
-function showError(message: string): void {
-  const canvas = document.getElementById('canvas');
-  const errorDiv = document.getElementById('error');
-
-  if (canvas) {
-    canvas.classList.add('hidden');
-  }
-
-  if (errorDiv) {
-    errorDiv.innerHTML = `
-      <h2>WebGPU Not Available</h2>
-      <p>${message}</p>
-      <p style="margin-top: 1rem; font-size: 0.9em; opacity: 0.8;">
-        WebGPU is a modern graphics API. For the best experience, use the latest version of
-        <a href="https://www.google.com/chrome/" target="_blank">Chrome</a> or
-        <a href="https://www.microsoft.com/edge" target="_blank">Edge</a>.
-      </p>
-    `;
-    errorDiv.classList.remove('hidden');
-  }
-}
+import init, { App, scene_catalog } from '../../crates/physicall-web/pkg/physicall_web.js';
+import { buildParams, formatNumber, type SceneSpec } from './ui';
 
 const canvas = document.getElementById('canvas') as HTMLCanvasElement;
+const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
-// Pending resize dimensions (applied in render loop)
-let pendingWidth: number | null = null;
-let pendingHeight: number | null = null;
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 
-// UI state
-let isPaused = false;
+function fail(title: string, message: string): void {
+  byId('error-title').textContent = title;
+  byId('error-message').textContent = message;
+  byId('error').hidden = false;
+  for (const id of ['panel', 'readout']) byId(id).hidden = true;
+  document.querySelector('.hint')?.remove();
+  canvas.hidden = true;
+}
 
-function setupResizeObserver(): void {
-  const observer = new ResizeObserver((entries) => {
-    const entry = entries[0];
-    if (!entry) return;
-
-    // Cap devicePixelRatio at 2 for performance on high-DPI displays
-    const dpr = Math.min(2, window.devicePixelRatio);
-
-    // Use devicePixelContentBoxSize if available (more accurate for HiDPI)
-    // Fall back to contentBoxSize * dpr
-    const dpSize = entry.devicePixelContentBoxSize?.[0];
-    if (dpSize) {
-      pendingWidth = Math.round(dpSize.inlineSize);
-      pendingHeight = Math.round(dpSize.blockSize);
-    } else {
-      const contentSize = entry.contentBoxSize[0];
-      pendingWidth = Math.round(contentSize.inlineSize * dpr);
-      pendingHeight = Math.round(contentSize.blockSize * dpr);
-    }
-  });
-
-  // Try to observe with device-pixel-content-box for best HiDPI support
+async function webgpuProblem(): Promise<string | null> {
+  if (!window.isSecureContext) return 'WebGPU only works on secure pages (HTTPS or localhost).';
+  if (!('gpu' in navigator)) return 'This browser does not support WebGPU (navigator.gpu is missing).';
   try {
-    observer.observe(canvas, { box: 'device-pixel-content-box' });
-  } catch {
-    // Fall back to content-box if device-pixel-content-box not supported
-    observer.observe(canvas, { box: 'content-box' });
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return 'WebGPU is present, but no GPU adapter is available. Hardware acceleration may be off.';
+  } catch (e) {
+    return `Requesting a GPU adapter failed: ${errorText(e)}`;
   }
+  return null;
 }
 
-function setupUIControls(): void {
-  const pauseBtn = document.getElementById('pause-btn') as HTMLButtonElement;
-  const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
-  const particleCountInput = document.getElementById('particle-count-input') as HTMLInputElement;
-  const gravitySlider = document.getElementById('gravity-slider') as HTMLInputElement;
-  const gravityValue = document.getElementById('gravity-value') as HTMLSpanElement;
-  const speedSlider = document.getElementById('speed-slider') as HTMLInputElement;
-  const speedValue = document.getElementById('speed-value') as HTMLSpanElement;
-  const pausedOverlay = document.getElementById('paused-overlay') as HTMLDivElement;
-  const presetSelect = document.getElementById('preset-select') as HTMLSelectElement;
-  const stiffnessGroup = document.getElementById('stiffness-group') as HTMLDivElement;
-  const stiffnessSlider = document.getElementById('stiffness-slider') as HTMLInputElement;
-  const stiffnessValue = document.getElementById('stiffness-value') as HTMLSpanElement;
-  const pressureGroup = document.getElementById('pressure-group') as HTMLDivElement;
-  const pressureSlider = document.getElementById('pressure-slider') as HTMLInputElement;
-  const pressureValue = document.getElementById('pressure-value') as HTMLSpanElement;
-  const initialSpeedGroup = document.getElementById('initial-speed-group') as HTMLDivElement;
-
-  // Updates visibility of mode-specific controls
-  function updateModeControls(mode: number): void {
-    const isNBody = mode === 0;
-    const isSoftBody = mode === 3;
-    // Show/hide N-body specific controls
-    initialSpeedGroup.classList.toggle('hidden', !isNBody);
-    particleCountInput.classList.toggle('hidden', !isNBody);
-    // Show/hide constraint-specific controls
-    stiffnessGroup.classList.toggle('hidden', isNBody);
-    // Pressure slider only for soft body
-    pressureGroup.classList.toggle('hidden', !isSoftBody);
-  }
-
-  // Preset selector
-  presetSelect.addEventListener('change', () => {
-    const mode = parseInt(presetSelect.value, 10);
-    set_simulation_mode(mode);
-    updateModeControls(mode);
-  });
-
-  // Pause/Resume button
-  pauseBtn.addEventListener('click', () => {
-    isPaused = !isPaused;
-    set_paused(isPaused);
-    pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
-    if (isPaused) {
-      pausedOverlay.classList.remove('hidden');
-    } else {
-      pausedOverlay.classList.add('hidden');
-    }
-  });
-
-  // Reset button — uses particle count from input (N-body mode only)
-  resetBtn.addEventListener('click', () => {
-    const mode = parseInt(presetSelect.value, 10);
-    if (mode === 0) {
-      const count = parseInt(particleCountInput.value, 10);
-      if (count > 0) {
-        reset_simulation_with_count(count);
-      } else {
-        reset_simulation();
-      }
-    } else {
-      reset_simulation();
-    }
-  });
-
-  // Gravity slider
-  gravitySlider.addEventListener('input', () => {
-    const value = parseFloat(gravitySlider.value);
-    set_gravity(value);
-    gravityValue.textContent = value.toFixed(1);
-  });
-
-  // Speed slider
-  speedSlider.addEventListener('input', () => {
-    const value = parseFloat(speedSlider.value);
-    set_time_scale(value);
-    speedValue.textContent = value.toFixed(1);
-  });
-
-  // Initial speed slider (takes effect on next reset, N-body only)
-  const initialSpeedSlider = document.getElementById('initial-speed-slider') as HTMLInputElement;
-  const initialSpeedValueEl = document.getElementById('initial-speed-value') as HTMLSpanElement;
-  initialSpeedSlider.addEventListener('input', () => {
-    const value = parseFloat(initialSpeedSlider.value);
-    set_initial_speed(value);
-    initialSpeedValueEl.textContent = value.toFixed(1);
-  });
-
-  // Stiffness slider (constraint modes only)
-  stiffnessSlider.addEventListener('input', () => {
-    const value = parseFloat(stiffnessSlider.value);
-    set_stiffness(value);
-    stiffnessValue.textContent = value.toFixed(2);
-  });
-
-  // Pressure slider (soft body only)
-  pressureSlider.addEventListener('input', () => {
-    const value = parseFloat(pressureSlider.value);
-    set_pressure(value);
-    pressureValue.textContent = value.toFixed(1);
-  });
+function devicePixels(): [number, number] {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  return [Math.max(1, Math.round(canvas.clientWidth * dpr)), Math.max(1, Math.round(canvas.clientHeight * dpr))];
 }
 
-// Stats display state
-let lastFrameTimestamp = 0;
-let smoothedFps = 0;
-let smoothedFrameTime = 0;
-let lastDisplayUpdate = 0;
-let fpsValue: HTMLSpanElement | null = null;
-let frametimeValue: HTMLSpanElement | null = null;
-let statsParticleCount: HTMLSpanElement | null = null;
-
-const EMA_ALPHA = 0.1;
-const DISPLAY_INTERVAL = 500; // ms
-
-function renderLoop(timestamp: DOMHighResTimeStamp): void {
-  // Apply pending resize before rendering
-  if (pendingWidth !== null && pendingHeight !== null) {
-    if (pendingWidth > 0 && pendingHeight > 0) {
-      canvas.width = pendingWidth;
-      canvas.height = pendingHeight;
-      resize(pendingWidth, pendingHeight);
-    }
-    pendingWidth = null;
-    pendingHeight = null;
-  }
-
-  render();
-
-  // FPS / frame time tracking
-  if (lastFrameTimestamp > 0) {
-    const frameTime = timestamp - lastFrameTimestamp;
-    const fps = 1000 / frameTime;
-    smoothedFps = smoothedFps === 0 ? fps : smoothedFps * (1 - EMA_ALPHA) + fps * EMA_ALPHA;
-    smoothedFrameTime = smoothedFrameTime === 0 ? frameTime : smoothedFrameTime * (1 - EMA_ALPHA) + frameTime * EMA_ALPHA;
-  }
-  lastFrameTimestamp = timestamp;
-
-  // Throttled DOM update every 500ms
-  if (timestamp - lastDisplayUpdate >= DISPLAY_INTERVAL) {
-    lastDisplayUpdate = timestamp;
-    if (fpsValue) fpsValue.textContent = smoothedFps > 0 ? String(Math.round(smoothedFps)) : '--';
-    if (frametimeValue) frametimeValue.textContent = smoothedFrameTime > 0 ? smoothedFrameTime.toFixed(1) : '--';
-    if (statsParticleCount) statsParticleCount.textContent = String(get_particle_count());
-  }
-
-  requestAnimationFrame(renderLoop);
+function canvasPoint(e: MouseEvent): [number, number] {
+  const r = canvas.getBoundingClientRect();
+  return [((e.clientX - r.left) * canvas.width) / r.width, ((e.clientY - r.top) * canvas.height) / r.height];
 }
 
-async function main() {
-  // Check WebGPU support before doing anything
-  const check = await checkWebGPUSupport();
-  if (!check.supported) {
-    showError(check.error ?? 'WebGPU is not supported.');
-    return;
-  }
+async function main(): Promise<void> {
+  const problem = await webgpuProblem();
+  if (problem) return fail('WebGPU is not available', problem);
 
-  // Initialize WASM
   await init();
-  console.log('WASM loaded successfully');
+  const scenes: SceneSpec[] = JSON.parse(scene_catalog());
+  const initial = scenes.find((s) => `#${s.id}` === location.hash) ?? scenes.find((s) => s.id === 'cloth') ?? scenes[0];
 
-  // Set initial canvas size to match display size
-  const dpr = Math.min(2, window.devicePixelRatio);
-  canvas.width = Math.round(canvas.clientWidth * dpr);
-  canvas.height = Math.round(canvas.clientHeight * dpr);
+  [canvas.width, canvas.height] = devicePixels();
+  let app: App;
+  try {
+    app = await App.create(canvas, initial.id);
+  } catch (e) {
+    return fail('Could not start the GPU simulation', errorText(e));
+  }
 
-  // Initialize WebGPU
-  await init_webgpu('canvas');
+  new ResizeObserver(() => {
+    [canvas.width, canvas.height] = devicePixels();
+    app.resize(canvas.width, canvas.height);
+  }).observe(canvas);
 
-  // Set up resize observer for responsive canvas
-  setupResizeObserver();
+  let current = initial;
+  const sceneButtons = scenes.map((scene) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = scene.label;
+    button.addEventListener('click', () => select(scene));
+    return button;
+  });
+  byId('scenes').replaceChildren(...sceneButtons);
 
-  // Set up UI controls
-  setupUIControls();
+  const setParam = (key: string, value: number) => app.set_param(key, value);
+  function select(scene: SceneSpec): void {
+    if (scene !== current) app.load_scene(scene.id);
+    current = scene;
+    history.replaceState(null, '', `#${scene.id}`);
+    sceneButtons.forEach((b, i) => b.setAttribute('aria-pressed', String(scenes[i] === scene)));
+    buildParams(byId('params'), scene, setParam);
+    byId('r-note').textContent =
+      scene.id === 'nbody'
+        ? 'G = 1 units. Leapfrog keeps the energy error bounded instead of drifting.'
+        : 'SI units. Drag, friction and inelastic contacts remove energy; pins and the floor exchange momentum.';
+  }
+  select(initial);
 
-  // Set up stats display references
-  fpsValue = document.getElementById('fps-value') as HTMLSpanElement;
-  frametimeValue = document.getElementById('frametime-value') as HTMLSpanElement;
-  statsParticleCount = document.getElementById('stats-particle-count') as HTMLSpanElement;
+  let paused = false;
+  const pauseButton = byId<HTMLButtonElement>('pause');
+  const togglePause = () => {
+    paused = !paused;
+    app.set_paused(paused);
+    pauseButton.textContent = paused ? 'Resume' : 'Pause';
+  };
+  pauseButton.addEventListener('click', togglePause);
+  byId('reset').addEventListener('click', () => app.reset());
+  byId('camera').addEventListener('click', () => app.reset_camera());
 
-  // Set up keyboard handlers
-  const statsPanel = document.getElementById('stats') as HTMLDivElement;
-  let statsVisible = true;
+  const speed = byId<HTMLInputElement>('speed');
+  speed.addEventListener('input', () => {
+    app.set_speed(Number(speed.value));
+    byId('speed-value').textContent = `${Number(speed.value).toFixed(2)}×`;
+  });
 
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'r' || e.key === 'R') {
-      reset_camera();
-    }
-    if (e.ctrlKey && (e.key === 'y' || e.key === 'Y')) {
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    app.pointer_down(...canvasPoint(e), e.button, e.shiftKey);
+  });
+  canvas.addEventListener('pointermove', (e) => app.pointer_move(...canvasPoint(e)));
+  for (const type of ['pointerup', 'pointercancel'] as const) canvas.addEventListener(type, () => app.pointer_up());
+  canvas.addEventListener('pointerleave', () => app.pointer_leave());
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener(
+    'wheel',
+    (e) => {
       e.preventDefault();
-      statsVisible = !statsVisible;
-      statsPanel.classList.toggle('hidden', !statsVisible);
+      app.wheel(e.deltaY * (e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 33 : 1));
+    },
+    { passive: false },
+  );
+  window.addEventListener('keydown', (e) => {
+    if (e.target instanceof HTMLInputElement && e.key !== ' ') return;
+    if (e.key === ' ') {
+      e.preventDefault();
+      togglePause();
+    } else if (e.key === 'r' || e.key === 'R') {
+      app.reset();
     }
   });
 
-  // Start render loop
-  requestAnimationFrame(renderLoop);
+  const readout = (id: string, text: string) => (byId(`r-${id}`).textContent = text);
+  let last = performance.now();
+  let frameTime = 1 / 60;
+  let lastReadout = 0;
+  const tick = (now: number) => {
+    const elapsed = Math.min((now - last) / 1000, 0.25);
+    last = now;
+    frameTime += 0.05 * (elapsed - frameTime);
+    try {
+      app.frame(elapsed);
+    } catch (e) {
+      return fail('The simulation stopped', errorText(e));
+    }
+    if (now - lastReadout > 250) {
+      lastReadout = now;
+      const s = app.stats();
+      const si = current.id !== 'nbody';
+      readout('time', `${s.time.toFixed(2)} s`);
+      readout('particles', String(s.particles || '–'));
+      readout('steps', String(s.steps));
+      readout('fps', (1 / frameTime).toFixed(0));
+      readout('kinetic', formatNumber(s.kinetic) + (si ? ' J' : ''));
+      readout('potential', formatNumber(s.potential) + (si ? ' J' : ''));
+      readout('total', formatNumber(s.total) + (si ? ' J' : ''));
+      readout('drift', s.particles && Number.isFinite(s.drift) ? `${(100 * s.drift).toFixed(3)} %` : '–');
+      // A live parameter change restarts the baseline; say so rather than show a jump.
+      byId('r-drift-label').textContent = s.since > 0 ? `ΔE / E₀ since ${s.since.toFixed(1)} s` : 'ΔE / E₀';
+      readout('momentum', formatNumber(s.momentum) + (si ? ' kg·m/s' : ''));
+      s.free();
+    }
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
 
-main().catch((e) => {
-  console.error(e);
-  showError(`Unexpected error: ${e instanceof Error ? e.message : String(e)}`);
-});
+main().catch((e) => fail('Something went wrong', errorText(e)));

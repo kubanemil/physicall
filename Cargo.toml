@@ -1,18 +1,32 @@
 [workspace]
-resolver = "2"
-members = ["crates/physicall-core"]
+resolver = "3"
+members = ["crates/physicall-core", "crates/physicall-gpu", "crates/physicall-web"]
 
 [workspace.package]
-edition = "2021"
 version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kubanemil/physicall"
 
 [workspace.dependencies]
-wasm-bindgen = "0.2.100"
-web-sys = "0.3.77"
-js-sys = "0.3.77"
-wasm-bindgen-futures = "0.4.43"
-console_error_panic_hook = "0.1.7"
-log = "0.4"
-wgpu = "28.0"
+physicall-core = { path = "crates/physicall-core" }
+physicall-gpu = { path = "crates/physicall-gpu" }
 bytemuck = { version = "1.21", features = ["derive"] }
-glam = { version = "0.29", features = ["bytemuck"] }
+glam = "0.33"
+naga = { version = "30", features = ["wgsl-in"] }
+pollster = "1.0"
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl"] }
+wasm-bindgen = "0.2.100"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
+console_error_panic_hook = "0.1.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
+# The reference solver runs long simulations in tests; optimise it even in debug builds.
+[profile.dev.package.physicall-core]
+opt-level = 3
