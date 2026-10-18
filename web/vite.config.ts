@@ -1,16 +1,8 @@
 import { defineConfig } from 'vite';
-import wasm from 'vite-plugin-wasm';
-import topLevelAwait from 'vite-plugin-top-level-await';
 
-export default defineConfig({
-  plugins: [wasm(), topLevelAwait()],
-  build: {
-    target: 'esnext',
-  },
-  server: {
-    fs: {
-      // Allow serving files from the parent directory (for WASM package)
-      allow: ['..'],
-    },
-  },
-});
+// GitHub Pages serves the project under /physicall/.
+export default defineConfig(({ command }) => ({
+  base: command === 'build' ? '/physicall/' : '/',
+  build: { target: 'es2022' },
+  server: { fs: { allow: ['..'] } },
+}));

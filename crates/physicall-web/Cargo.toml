@@ -1,0 +1,28 @@
+[package]
+name = "physicall-web"
+description = "WebAssembly bindings and WebGPU renderer for the physicall demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+physicall-core.workspace = true
+physicall-gpu.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+console_error_panic_hook.workspace = true
+web-sys = { workspace = true, features = ["HtmlCanvasElement"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+naga.workspace = true
+pollster.workspace = true
