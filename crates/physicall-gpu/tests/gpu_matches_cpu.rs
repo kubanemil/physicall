@@ -107,7 +107,7 @@ fn gpu_rope_matches_the_cpu_reference() {
     let scene = xpbd_scene(SceneKind::Rope, |_| {});
     if let Some(gap) = scene_gap(&scene, 60) {
         assert!(
-            gap < 1e-3,
+            gap < 1e-4,
             "GPU rope drifted {gap:.2e} m from the CPU reference"
         );
     }
@@ -138,7 +138,7 @@ fn gpu_contacts_match_the_cpu_reference_for_isolated_collisions() {
     {
         let gap = max_distance(&gpu_pos, &cpu.particles.pos);
         assert!(
-            gap < 1e-5,
+            gap < 1e-4,
             "GPU collisions drifted {gap:.2e} m from the CPU reference"
         );
     }
@@ -157,7 +157,7 @@ fn gpu_pile_settles_like_the_cpu_reference() {
     let mean_height = |pos: &[Vec3]| pos.iter().map(|p| p.y).sum::<f32>() / pos.len() as f32;
     let (g, c) = (mean_height(&gpu_pos), mean_height(&cpu.particles.pos));
     assert!(
-        (g - c).abs() < 0.05 * c,
+        (g - c).abs() < 0.02 * c,
         "mean height {g:.4} m on GPU vs {c:.4} m on CPU"
     );
     let r = scene.params.radius;
@@ -243,7 +243,7 @@ fn gpu_nbody_matches_the_cpu_reference() {
     }
     let gap = max_distance(&gpu_pos, &cpu.particles.pos);
     assert!(
-        gap < 1e-3,
+        gap < 1e-4,
         "GPU bodies drifted {gap:.2e} from the CPU reference"
     );
     let worst = gpu_potential

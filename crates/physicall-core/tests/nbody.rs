@@ -51,7 +51,7 @@ fn kepler_orbit_energy_error_stays_bounded_over_many_orbits() {
         }
     }
     let drift = ((sim.diagnostics().total() - after_first) / e0).abs();
-    assert!(worst < 1e-3, "energy error reached {worst:.2e}");
+    assert!(worst < 2e-4, "energy error reached {worst:.2e}");
     assert!(
         drift < 1e-4,
         "energy drifted {drift:.2e} between orbit 1 and {orbits}"
@@ -74,7 +74,7 @@ fn kepler_orbit_returns_to_apoapsis_after_one_period() {
     }
     let error = sim.particles.pos[1].distance(start.pos[1]);
     assert!(
-        error < 1e-2,
+        error < 5e-4,
         "body is {error:.2e} away from its start after one period"
     );
 }
@@ -105,7 +105,7 @@ fn nbody_conserves_momentum() {
     }
     let change = (sim.diagnostics().momentum - start.momentum).length() / scale;
     assert!(
-        change < 1e-5,
+        change < 1e-6,
         "momentum changed by {change:.2e} of its scale"
     );
 }
@@ -124,5 +124,5 @@ fn nbody_cluster_conserves_energy_with_softening() {
         sim.step(&params);
     }
     let error = ((sim.diagnostics().total() - e0) / e0).abs();
-    assert!(error < 5e-3, "energy error {error:.2e} after 4 time units");
+    assert!(error < 1e-3, "energy error {error:.2e} after 4 time units");
 }
