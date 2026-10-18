@@ -185,7 +185,8 @@ impl Simulation {
         }
     }
 
-    pub fn record_readback(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Returns false when a readback is still in flight.
+    pub fn record_readback(&self, encoder: &mut wgpu::CommandEncoder) -> bool {
         match &self.solver {
             Solver::Xpbd { gpu, .. } => self
                 .readback
@@ -194,7 +195,7 @@ impl Simulation {
                 encoder,
                 &[gpu.positions(), gpu.velocities(), gpu.accelerations()],
             ),
-        };
+        }
     }
 
     pub fn map_readback(&self) {

@@ -151,7 +151,9 @@ async function main(): Promise<void> {
       readout('kinetic', formatNumber(s.kinetic) + (si ? ' J' : ''));
       readout('potential', formatNumber(s.potential) + (si ? ' J' : ''));
       readout('total', formatNumber(s.total) + (si ? ' J' : ''));
-      readout('drift', s.particles ? `${(100 * s.drift).toFixed(3)} %` : '–');
+      readout('drift', s.particles && Number.isFinite(s.drift) ? `${(100 * s.drift).toFixed(3)} %` : '–');
+      // A live parameter change restarts the baseline; say so rather than show a jump.
+      byId('r-drift-label').textContent = s.since > 0 ? `ΔE / E₀ since ${s.since.toFixed(1)} s` : 'ΔE / E₀';
       readout('momentum', formatNumber(s.momentum) + (si ? ' kg·m/s' : ''));
       s.free();
     }

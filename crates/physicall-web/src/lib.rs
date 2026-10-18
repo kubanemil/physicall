@@ -41,8 +41,11 @@ pub struct Stats {
     pub kinetic: f64,
     pub potential: f64,
     pub total: f64,
-    /// `(E - E0) / |E0|` since the scene was built.
+    /// `(E - E0) / |E0|`, where E0 was measured at simulated time `since`.
     pub drift: f64,
+    /// When the energy baseline was taken: at the start, or after the last
+    /// live parameter change.
+    pub since: f64,
     pub momentum: f64,
     pub particles: u32,
     pub steps: u32,
@@ -79,7 +82,12 @@ pub struct App {
     speed: f64,
     paused: bool,
     snapshot: Option<Snapshot>,
-    initial_energy: Option<f64>,
+    /// Energy baseline and the simulated time it was taken at.
+    baseline: Option<(f64, f64)>,
+    /// Bumped whenever the baseline must be retaken; readbacks recorded
+    /// before the bump describe the old parameters.
+    generation: u64,
+    readback_generation: u64,
     stats: Stats,
     pointer: Option<Pointer>,
     hovered: Option<u32>,
@@ -183,7 +191,9 @@ impl App {
             speed: 1.0,
             paused: false,
             snapshot: None,
-            initial_energy: None,
+            baseline: None,
+            generation: 0,
+            readback_generation: 0,
             stats: Stats::default(),
             pointer: None,
             hovered: None,
@@ -203,7 +213,10 @@ impl App {
 
     pub fn set_param(&mut self, key: &str, value: f32) -> Result<(), JsError> {
         match self.settings.set(key, value) {
-            Some(Change::Live) => self.sim.apply(&self.queue, &self.settings),
+            Some(Change::Live) => {
+                self.sim.apply(&self.queue, &self.settings);
+                self.reset_baseline();
+            }
             Some(Change::Rebuild) => self.rebuild(),
             None => return Err(JsError::new(&format!("{key} = {value} is not valid here"))),
         }
@@ -246,9 +259,26 @@ impl App {
     /// Advances by `elapsed` real seconds in fixed steps, then draws.
     pub fn frame(&mut self, elapsed: f64) -> Result<(), JsError> {
         if let Some(snapshot) = self.sim.take_snapshot() {
-            self.update_stats(&snapshot);
+            if self.readback_generation == self.generation {
+                self.update_stats(&snapshot);
+            }
             self.snapshot = Some(snapshot);
         }
+
+        // A frame with nothing to draw on still runs its steps, so simulated
+        // time never drops.
+        let surface = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => None,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(JsError::new("the canvas surface failed validation"));
+            }
+        };
         let steps = if self.paused {
             0
         } else {
@@ -262,36 +292,26 @@ impl App {
             self.sim.place(&self.queue, *index, *target, 0.0);
         }
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(JsError::new("the canvas surface failed validation"));
-            }
-        };
-        let view = frame.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.sim.encode(&mut encoder, steps);
-        self.renderer.draw(
-            &self.queue,
-            &mut encoder,
-            &view,
-            &self.sim.drawable,
-            &self.render_uniforms(),
-        );
-        if self.frames.is_multiple_of(READBACK_EVERY) {
-            self.sim.record_readback(&mut encoder);
+        if let Some(frame) = &surface {
+            let view = frame.texture.create_view(&Default::default());
+            self.renderer.draw(
+                &self.queue,
+                &mut encoder,
+                &view,
+                &self.sim.drawable,
+                &self.render_uniforms(),
+            );
+        }
+        if self.frames.is_multiple_of(READBACK_EVERY) && self.sim.record_readback(&mut encoder) {
+            self.readback_generation = self.generation;
         }
         self.queue.submit([encoder.finish()]);
         self.sim.map_readback();
-        self.queue.present(frame);
+        if let Some(frame) = surface {
+            self.queue.present(frame);
+        }
 
         self.time += f64::from(steps) * f64::from(scene::STEP);
         self.stats.steps = steps;
@@ -368,8 +388,8 @@ impl App {
             &scene,
         );
         self.snapshot = None;
-        self.initial_energy = None;
         self.stats = Stats::default();
+        self.reset_baseline();
         self.pointer = None;
         self.hovered = None;
         self.time = 0.0;
@@ -424,10 +444,16 @@ impl App {
         frame_uniforms(&self.camera, self.size(), &self.sim, self.highlight())
     }
 
+    fn reset_baseline(&mut self) {
+        self.baseline = None;
+        self.generation += 1;
+        self.stats.drift = f64::NAN;
+    }
+
     fn update_stats(&mut self, snapshot: &Snapshot) {
         let d = self.sim.diagnostics(snapshot);
         let total = d.total();
-        let e0 = *self.initial_energy.get_or_insert(total);
+        let (e0, since) = *self.baseline.get_or_insert((total, self.time));
         self.stats = Stats {
             kinetic: d.kinetic,
             potential: d.potential,
@@ -437,6 +463,7 @@ impl App {
             } else {
                 (total - e0) / e0.abs()
             },
+            since,
             momentum: d.momentum.length(),
             particles: snapshot.pos.len() as u32,
             steps: self.stats.steps,
@@ -518,7 +545,7 @@ mod tests {
                 &frame_uniforms(&camera, size, &sim, None),
             );
             if frame + 1 == frames {
-                sim.record_readback(&mut encoder);
+                assert!(sim.record_readback(&mut encoder));
                 encoder.copy_texture_to_buffer(
                     target.as_image_copy(),
                     wgpu::TexelCopyBufferInfo {

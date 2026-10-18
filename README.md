@@ -42,7 +42,7 @@ bit-identical positions.
         v
   physicall-gpu    compute pipelines, one per kernel
                    XPBD substep: predict > solve colour 1..k > hash: clear, count,
-                                 scan, scatter, sort > contacts > finish
+                                 two-level scan, scatter > contacts > finish
                    N-body step:  kick-drift > tiled gravity and kick
                    shared structs: one Rust declaration gives the repr(C) type,
                                  its WGSL and compile-time layout asserts
@@ -68,8 +68,8 @@ bit-identical positions.
   0.5%.
 - A spatial hash: a uniform grid with cells one particle wide, hashed into a table with the
   primes of Teschner et al. 2003 ("Optimized Spatial Hashing for Collision Detection of
-  Deformable Objects"). Each substep rebuilds it by counting sort: atomic counts, a prefix sum
-  in one workgroup, a scatter, and a sort inside each bucket so runs are reproducible.
+  Deformable Objects"). Each substep rebuilds it by counting sort: atomic counts, a two-level
+  prefix sum and a scatter. An optional sort inside each bucket makes runs repeat exactly.
 - Particle contacts with Jacobi iterations, constraint averaging and position-based Coulomb
   friction (Macklin et al. 2014, "Unified Particle Physics for Real-Time Applications").
 - N-body gravity by direct summation with Plummer softening, tiled through workgroup memory
@@ -96,12 +96,12 @@ lavapipe, Mesa's software Vulkan driver.
 | Spatial hash, random sets | neighbours vs brute force, tables of 1 to 4096 buckets | exact | exact |
 | 1200 grains dropped in a box | deepest overlap; never above the drop height | 10% of radius | 5.2% |
 | Grain sliding on the floor | distance vs v²/(2μg) | 5 mm | 0.8 mm |
-| GPU vs CPU: rope, 60 steps | largest position gap | 0.1 mm | 0 |
-| GPU vs CPU: cloth, 20 steps | largest position gap | 0.5 mm | 0.065 mm |
-| GPU vs CPU: 100 colliding pairs, 30 steps | largest position gap | 0.1 mm | 0.003 mm |
-| GPU vs CPU: 1000 bodies, 30 steps | largest position gap | 10⁻⁴ | 1.1×10⁻⁷ |
-| GPU vs CPU: spatial hash | bucket offsets and contents | exact | exact |
-| GPU vs CPU: settled pile | mean height | 2% | 0.2% |
+| GPU vs CPU: rope, 60 steps | largest position gap | 10⁻⁶ m | 0 |
+| GPU vs CPU: cloth, 20 steps | largest position gap | 0.2 mm | 0.065 mm |
+| GPU vs CPU: 100 colliding pairs, 30 steps | largest position gap | 0.01 mm | 0.003 mm |
+| GPU vs CPU: 1000 bodies, 30 steps | largest position gap; potentials | 10⁻⁶ | 1.1×10⁻⁷; 2.2×10⁻⁷ |
+| GPU vs CPU: spatial hash, 32 scan blocks | bucket offsets; contents, sorted or not | exact | exact |
+| GPU vs CPU: settled pile | mean height | 1% | 0.24% |
 | Shared structs | Rust offsets vs WGSL offsets | compile time, plus naga | match |
 | Every scene | renders with no wgpu validation errors | none | none |
 
@@ -110,7 +110,8 @@ substep shorter than about 1/1000 s rounds away part of each gravity step: the p
 error grows from 0.04% at 10 substeps to 1.1% at 80. The defaults stay where smaller steps still
 help. And GPUs fuse multiply-adds that the CPU rounds twice, so GPU and CPU runs start one
 rounding step apart. Folding cloth and falling grains magnify that, which is why those checks use
-short runs, isolated collisions or statistics.
+short runs, isolated collisions or statistics. The GPU tolerances leave a few ULP for GPUs that
+round sqrt and division less exactly than lavapipe.
 
 ## Layout
 
@@ -160,6 +161,8 @@ it. Space pauses and R resets. XPBD scenes use SI units; the N-body scene uses G
 | Fixed 1/60 s steps from an accumulator | A step per frame | Results depend on simulated time only. A frame that falls behind drops time instead of taking a bigger step. |
 | Tethers on pinned cloth and rope | More substeps | They remove most of the stretch near the pins for one extra dispatch per pin. |
 | Drag as a rate on velocity | A damping factor per frame | It has units, does not change with frame rate and leaves a resting body alone. |
+| Bucket sort only on request | Sorting every substep | Atomics fill buckets in any order, which only changes how contact sums round. Tests and repeatable runs turn the sort on; the demo skips its dispatch and O(k²) per bucket. |
+| Grid cell from position times inverse cell size | Position divided by cell size | Multiplication rounds exactly on every GPU. WGSL division may be 2.5 ULP off and put a particle on a cell boundary in a different cell than the CPU. |
 | Contact relaxation of 1 | Over-relaxation | Velocity comes from displacement, so overshooting throws grains. At 1.5 they flew to 5.7 m after a 1.2 m drop. |
 | Leapfrog | Semi-implicit Euler | Same cost, but second order and time-reversible, so the energy error stays bounded. |
 | Direct gravity in tiles | Barnes-Hut | Exact forces and a short kernel, fast enough for 16k bodies. |
