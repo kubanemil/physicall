@@ -132,7 +132,6 @@ fn gpu_contacts_match_the_cpu_reference_for_isolated_collisions() {
         friction: 0.4,
         self_collision: true,
         contact_iterations: 2,
-        contact_relaxation: 1.5,
         ..XpbdParams::default()
     };
     if let Some((gpu_pos, cpu)) = run_both(&particles, &ColouredConstraints::default(), &params, 30)

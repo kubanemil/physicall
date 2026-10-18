@@ -24,7 +24,11 @@ pub struct XpbdParams {
     pub bounds: Bounds,
     pub friction: f32,
     pub self_collision: bool,
+    /// Jacobi contact passes per substep. More substeps converge faster
+    /// (Macklin et al. 2019), so one is the default.
     pub contact_iterations: u32,
+    /// Over-relaxation of averaged contact corrections. Above 1 it injects
+    /// energy into piles, because velocities are derived from positions.
     pub contact_relaxation: f32,
 }
 

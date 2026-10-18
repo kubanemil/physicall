@@ -13,12 +13,12 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-    pub fn new(target: Vec3, distance: f32) -> Self {
+    pub fn new(target: Vec3, distance: f32, azimuth: f32, polar: f32) -> Self {
         Self {
             target,
             distance,
-            azimuth: 0.6,
-            polar: 0.35,
+            azimuth,
+            polar,
         }
     }
 
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn ray_through_the_centre_hits_the_target() {
-        let camera = OrbitCamera::new(Vec3::new(0.0, 1.0, 0.0), 3.0);
+        let camera = OrbitCamera::new(Vec3::new(0.0, 1.0, 0.0), 3.0, 0.6, 0.35);
         let size = Vec2::new(800.0, 600.0);
         let (origin, dir) = camera.ray(size * 0.5, size);
         let along = (camera.target - origin).dot(dir);

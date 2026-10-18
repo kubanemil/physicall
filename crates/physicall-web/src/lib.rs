@@ -123,10 +123,10 @@ fn frame_uniforms(
 
 fn framing(kind: SceneKind) -> OrbitCamera {
     match kind {
-        SceneKind::NBody => OrbitCamera::new(Vec3::ZERO, 4.5),
-        SceneKind::Cloth => OrbitCamera::new(Vec3::new(0.0, 1.0, 0.0), 2.8),
-        SceneKind::Rope => OrbitCamera::new(Vec3::new(0.0, 1.2, 0.0), 4.2),
-        SceneKind::Collisions => OrbitCamera::new(Vec3::new(0.0, 0.3, 0.0), 2.2),
+        SceneKind::NBody => OrbitCamera::new(Vec3::ZERO, 3.2, 0.6, 0.45),
+        SceneKind::Cloth => OrbitCamera::new(Vec3::new(0.0, 1.0, 0.0), 2.4, 0.7, 0.3),
+        SceneKind::Rope => OrbitCamera::new(Vec3::new(-0.2, 1.1, 0.0), 3.6, 0.15, 0.15),
+        SceneKind::Collisions => OrbitCamera::new(Vec3::new(0.0, 0.25, 0.0), 2.2, 0.6, 0.5),
     }
 }
 

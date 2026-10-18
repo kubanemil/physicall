@@ -160,7 +160,7 @@ const COLLISIONS: &[ParamSpec] = &[
     ),
     linear("friction", "Friction", "", [0.0, 1.0, 0.3], 0.05, false),
     GRAVITY,
-    linear("substeps", "Substeps", "", [1.0, 30.0, 10.0], 1.0, false),
+    linear("substeps", "Substeps", "", [1.0, 40.0, 20.0], 1.0, false),
 ];
 
 const CLOTH_SIZE: f32 = 1.0;
@@ -273,7 +273,7 @@ impl Settings {
                     gravity: self.gravity(),
                     drag: self.value("drag"),
                     compliance: [stretch, stretch, stretch, 0.0],
-                    radius: 0.4 * ROPE_LENGTH / self.count("segments") as f32,
+                    radius: 0.5 * ROPE_LENGTH / self.count("segments") as f32,
                     bounds: floor,
                     friction: 0.5,
                     ..XpbdParams::default()
@@ -289,8 +289,6 @@ impl Settings {
                 },
                 friction: self.value("friction"),
                 self_collision: true,
-                contact_iterations: 2,
-                contact_relaxation: 1.5,
                 ..XpbdParams::default()
             },
         }

@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn picks_the_particle_under_the_cursor() {
-        let camera = OrbitCamera::new(Vec3::ZERO, 3.0);
+        let camera = OrbitCamera::new(Vec3::ZERO, 3.0, 0.6, 0.35);
         let size = Vec2::new(800.0, 600.0);
         let view_proj = camera.projection(size.x / size.y) * camera.view();
         let positions = [

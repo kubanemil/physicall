@@ -12,7 +12,7 @@ const HALF_WIDTH: f32 = 0.3;
 
 fn pile_params() -> XpbdParams {
     XpbdParams {
-        substeps: 10,
+        substeps: 20,
         radius: RADIUS,
         bounds: Bounds {
             floor: Some(0.0),
@@ -20,8 +20,6 @@ fn pile_params() -> XpbdParams {
         },
         friction: 0.3,
         self_collision: true,
-        contact_iterations: 2,
-        contact_relaxation: 1.5,
         ..XpbdParams::default()
     }
 }
@@ -29,10 +27,17 @@ fn pile_params() -> XpbdParams {
 #[test]
 fn falling_pile_comes_to_rest_without_deep_overlaps() {
     let particles = scene::pile(1200, RADIUS, HALF_WIDTH, 9);
+    let drop_height = particles.pos.iter().map(|p| p.y).fold(0.0, f32::max);
     let mut sim = Xpbd::new(particles, ColouredConstraints::default());
     let params = pile_params();
     for _ in 0..240 {
         sim.step(&params);
+        // Inelastic contacts can only remove energy, so no grain may rise above where it started.
+        let top = sim.particles.pos.iter().map(|p| p.y).fold(0.0, f32::max);
+        assert!(
+            top <= drop_height,
+            "a grain was thrown to {top:.2} m, above the {drop_height:.2} m drop"
+        );
     }
 
     let p = &sim.particles;
